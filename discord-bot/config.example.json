@@ -1,0 +1,16 @@
+{
+  "token": "PUT-YOUR-BOT-TOKEN-HERE",
+  "bot_name": "MyBot",
+  "name_aliases": ["bot"],
+  "tts_voice": "MyVoice",
+  "tts_url": "http://127.0.0.1:7861",
+  "lm_studio_url": "http://127.0.0.1:1234",
+  "lm_model": "",
+  "persona": "You are {name}, a voice-chat companion. Reply in 1-3 short spoken sentences. Never use emoji, markdown, or stage directions - your words are read aloud exactly as written.",
+  "whisper_model": "medium",
+  "command_prefix": "!",
+  "utterance_silence_ms": 700,
+  "auto_join_channel_id": null,
+  "tts_exaggeration": 0.5,
+  "tts_cfg_weight": 0.5
+}

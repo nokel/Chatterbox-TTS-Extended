@@ -1,0 +1,6 @@
+# Real config holds the Discord bot token - never commit it.
+config.json
+# Generated test audio
+selftest_out.wav
+*.wav
+__pycache__/

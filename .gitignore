@@ -1,0 +1,24 @@
+# Python
+__pycache__
+.mypy_cache/
+.venv/
+.venv-amd/
+
+# VS Code
+*.code-workspace
+
+# machine-specific / rebuildable
+nltk_data/
+
+# huge model weights & training data (voices are also clones of real people)
+voices/
+finetuning/
+datasets/
+onnx_models/
+
+# generated output & personal session state
+output/
+temp/
+settings.json
+*.wav
+*.mp3

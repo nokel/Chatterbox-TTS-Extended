@@ -1,0 +1,68 @@
+# Chatterbox-TTS-Extended - single requirements file for the whole project
+# (web app, headless TTS API server, and the Discord voice bot).
+#
+# GPU backend (torch/torchaudio) is installed separately, BEFORE this file,
+# by install.ps1 based on the detected hardware (ROCm wheels for AMD, CUDA
+# wheels for NVIDIA, CPU wheels otherwise). torch must NOT be listed here or
+# pip would replace the hardware build with the generic CPU one.
+#
+# NOTE: faster-whisper pulls in the NVIDIA-only ctranslate2 from PyPI; on AMD
+# install.ps1 replaces it afterwards with OpenNMT's official ROCm Windows
+# wheel so faster-whisper runs on the AMD GPU too.
+
+# --- web app core ---
+gradio
+numpy
+# librosa 0.10.0 imports pkg_resources, which setuptools 81+ removed
+setuptools<81
+faster-whisper
+openai-whisper
+ffmpeg-python
+# unpinned: 27.1.1 does not support Python 3.12 (only 29.x+ is published for
+# it); the CLI flags the app uses (--edit audio:threshold, --margin,
+# --export audio, -o) are unchanged in 29.x
+auto-editor
+resampy==0.4.3
+librosa==0.10.0
+s3tokenizer
+spaces
+transformers==4.46.3
+diffusers==0.29.0
+omegaconf==2.3.0
+resemble-perth==1.0.1
+silero-vad==5.1.2
+conformer==0.3.2
+pyrnnoise==0.3.8
+soundfile
+nltk
+# imported directly by Chatter.py but absent from the upstream requirements
+# (it only arrived transitively); listed explicitly so installs can't miss it
+pydub
+# Live TTS through the local audio device
+sounddevice
+# Kokoro instant-TTS engine. NOTE: install with --no-deps (its declared
+# onnxruntime dependency would clobber the hardware-specific onnxruntime
+# build); install.ps1 handles this, plus the two real deps below.
+espeakng-loader
+phonemizer-fork
+# ONNX Runtime is NOT listed here: install.ps1 installs the variant that
+# matches the detected hardware, because they all ship the same
+# `onnxruntime` package and clobber each other (exactly one may exist):
+#   AMD     onnxruntime-webgpu   (DirectX 12; implements GroupQueryAttention,
+#                                 which the DirectML build cannot run)
+#   NVIDIA  onnxruntime-gpu      (CUDA)
+#   Intel   onnxruntime-openvino + openvino==2025.4.*  (versions must pair:
+#                                 1.24.x <-> 2025.4.*; a mismatch loads but
+#                                 silently falls back to CPU)
+#   CPU     onnxruntime
+huggingface_hub[hf_xet]
+
+# --- headless TTS API server (tts_server.py) ---
+fastapi
+uvicorn
+
+# --- Discord voice bot (discord-bot/bot.py) ---
+# discord.py 2.7+ required: it ships DAVE (E2EE voice) support via davey,
+# mandatory for Discord voice since March 2026.
+discord.py[voice]>=2.7
+discord-ext-voice-recv
