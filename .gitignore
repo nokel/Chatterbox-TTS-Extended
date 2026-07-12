@@ -16,3 +16,6 @@ install.log
 run.log
 *.wav
 *.mp3
+
+# per-book analysis/casting cache (derived from the user's own PDFs)
+audiobook/cache/

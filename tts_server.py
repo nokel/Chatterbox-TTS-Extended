@@ -10,9 +10,11 @@
 #               "exaggeration": 0.5, "cfg_weight": 0.5,
 #               "temperature": 0.8, "seed": null}
 #
-# Exactly one voice model is resident at a time; requesting a different voice
-# swaps it out. Output speech loudness is matched to the voice's original
-# training recordings (voices/<voice>/loudness.json), same as the main app.
+# A small LRU cache of voice models stays resident (default 3, override with
+# env CHATTERBOX_TTS_MAX_VOICES); the least recently used voice is evicted
+# when the cache is full. Output speech loudness is matched to the voice's
+# original training recordings (voices/<voice>/loudness.json), same as the
+# main app.
 #
 # Run with run_tts_server.ps1 (listens on http://127.0.0.1:7861).
 
@@ -44,8 +46,8 @@ PEAK_GUARD = 0.985
 app = FastAPI(title="Chatterbox headless TTS")
 
 _LOCK = threading.Lock()
-_MODEL = None
-_LOADED_VOICE = None
+_MODELS = {}          # voice name -> model, insertion order = LRU order
+_MAX_VOICES = max(1, int(os.environ.get("CHATTERBOX_TTS_MAX_VOICES", "3")))
 
 
 def list_voices():
@@ -59,25 +61,25 @@ def list_voices():
 
 
 def _get_model(voice):
-    """Load (or swap to) the requested voice. Caller holds _LOCK."""
-    global _MODEL, _LOADED_VOICE
-    if _LOADED_VOICE == voice and _MODEL is not None:
-        return _MODEL
+    """Load (or fetch cached) voice model, LRU-evicting. Caller holds _LOCK."""
+    if voice in _MODELS:
+        _MODELS[voice] = _MODELS.pop(voice)  # mark most recently used
+        return _MODELS[voice]
     import torch
     from chatterbox.src.chatterbox.tts import ChatterboxTTS
 
-    if _MODEL is not None:
-        print(f"[TTS] Evicting voice '{_LOADED_VOICE}'")
-        _MODEL = None
-        _LOADED_VOICE = None
+    while len(_MODELS) >= _MAX_VOICES:
+        old = next(iter(_MODELS))
+        print(f"[TTS] Evicting voice '{old}'")
+        del _MODELS[old]
         torch.cuda.empty_cache()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[TTS] Loading voice '{voice}' on {device}...")
-    _MODEL = ChatterboxTTS.from_local(os.path.join(VOICES_DIR, voice), device)
-    _LOADED_VOICE = voice
-    print(f"[TTS] Voice '{voice}' ready")
-    return _MODEL
+    _MODELS[voice] = ChatterboxTTS.from_local(
+        os.path.join(VOICES_DIR, voice), device)
+    print(f"[TTS] Voice '{voice}' ready ({len(_MODELS)}/{_MAX_VOICES} resident)")
+    return _MODELS[voice]
 
 
 def _split_text(text):
@@ -121,7 +123,9 @@ class TTSRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "loaded_voice": _LOADED_VOICE}
+    loaded = list(_MODELS)
+    return {"ok": True, "loaded_voices": loaded,
+            "loaded_voice": loaded[-1] if loaded else None}
 
 
 @app.get("/voices")

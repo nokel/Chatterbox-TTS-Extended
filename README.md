@@ -15,6 +15,10 @@ voice conversion, and artifact-reduced audio generation, based on
 - **Live TTS tab** — speaks while generating, streamed to the browser
 - **Headless TTS API server** — use trained voices from other programs
 - **Discord voice bot** — talk to a trained voice in a voice channel (DAVE/E2EE-ready)
+- **Audiobook reader** — turns a PDF ebook into a multi-voice audiobook: an LLM
+  reads the book, works out who speaks every line, and each character gets their
+  own trained voice; the reader highlights the words as they are spoken and
+  hooks into SumatraPDF
 - Fast startup: web page in seconds, model loads behind a self-hiding loading bar
 
 Upstream features (all preserved): multi-file input & batch output, candidate
@@ -37,6 +41,7 @@ tab, persistent settings UI, parallel processing.
   - [Voice Conversion](#voice-conversion)
 - [Headless TTS API server](#headless-tts-api-server)
 - [Discord voice bot](#discord-voice-bot)
+- [Audiobook reader (PDF → audiobook)](#audiobook-reader-pdf--audiobook)
 - [AMD implementation notes](#amd-implementation-notes)
 - [Tips & troubleshooting](#tips--troubleshooting)
 
@@ -328,6 +333,63 @@ seconds after joining while the encryption group finishes its handshake.
   say it; add likely spellings to `name_aliases`.
 
 ---
+
+## Audiobook reader (PDF → audiobook)
+
+Turns a PDF ebook into a multi-voice audiobook, read aloud live with the
+text highlighted as it is spoken — like a screen reader, but with a cast.
+
+```powershell
+.\run_tts_server.ps1     # voices (always needed)
+.\run_audiobook.ps1      # the reader window (optionally: .\run_audiobook.ps1 book.pdf)
+```
+
+**How it works**
+
+1. **Open a PDF.** The reader extracts every word with its position on the
+   page and splits the text into narration and quoted dialogue.
+2. **Analyze characters** (needs LM Studio's local server with a model
+   loaded, same as the Discord bot). The language model reads the entire
+   book in order, works out who speaks every quoted line, discovers the
+   character roster as it goes, and merges duplicate names at the end.
+   Nothing is written next to your book — the analysis is cached in
+   `audiobook/cache/` keyed by the file's hash, so re-opening is instant.
+3. **Cast voices.** Every character found in the book appears in the Cast
+   panel with a line count; pick a trained voice for each. Everything that
+   isn't a character line is read by the **Narrator** voice (any voice you
+   like), and so are lines whose speaker the model couldn't identify.
+4. **Play.** Click any sentence to start reading from there. The words
+   being spoken are highlighted and the page turns automatically. The next
+   few lines are synthesized ahead in the background while the current one
+   plays.
+
+**Voice Lab** (button in the toolbar) is where character voices are made
+and tuned:
+
+- **Train a new voice from recordings** — the same VAD + Whisper + LoRA
+  fine-tuning pipeline as the web app's Voice Training tab, driven from
+  the reader.
+- **Wave match** — the tuner clones the *reference speaker's own
+  passages* across a grid of generation settings and measures every
+  candidate's waveform against the real recording: speaker-embedding
+  similarity (chatterbox's own voice encoder), long-term spectrum
+  (timbre), and pitch statistics. The program picks the test passages and
+  the winning settings — not the ear of whoever is training. The real
+  recording's wave trace and the clone's are drawn overlaid so you can
+  see how closely they line up, and one click applies the winning
+  settings to that character.
+- **Test voice** — reads one or two of that character's actual lines
+  from the book so you hear the voice in context before committing.
+
+**SumatraPDF integration.** SumatraPDF has no plugin API, so the reader
+hooks in through Sumatra's *external viewers* mechanism: press **Add to
+SumatraPDF** in the toolbar (with Sumatra closed) and "Audiobook Reader"
+appears in SumatraPDF's **File → Open With** menu for every PDF. A backup
+of `SumatraPDF-settings.txt` is written next to the original.
+
+Requirements: the headless TTS server must be running for playback and
+wave matching; LM Studio (any OpenAI-compatible local server on port
+11434) only for the one-time character analysis of each book.
 
 ## AMD implementation notes
 

@@ -1,5 +1,5 @@
 # Chatterbox-TTS-Extended - single requirements file for the whole project
-# (web app, headless TTS API server, and the Discord voice bot).
+# (web app, headless TTS API server, Discord voice bot, audiobook reader).
 #
 # GPU backend (torch/torchaudio) is installed separately, BEFORE this file,
 # by install.ps1 based on the detected hardware (ROCm wheels for AMD, CUDA
@@ -66,3 +66,7 @@ uvicorn
 # mandatory for Discord voice since March 2026.
 discord.py[voice]>=2.7
 discord-ext-voice-recv
+
+# --- audiobook reader (audiobook/reader.py) ---
+# PDF rendering + word-level text extraction for spoken-text highlighting
+pymupdf
