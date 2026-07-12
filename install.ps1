@@ -283,6 +283,21 @@ if ((Test-Path $reqStamp) -and ((Get-Content $reqStamp) -eq $reqHash)) {
     Set-Content -Path $reqStamp -Value $reqHash -Encoding ascii
 }
 
+# --- 5b. Re-assert the branch's ONNX Runtime build ------------------------------
+# Some requirements (e.g. silero-vad) declare a dependency on plain
+# `onnxruntime`. pip does not treat onnxruntime-webgpu/-gpu/-openvino as
+# satisfying it, so step 5 installs the plain CPU build ON TOP of the branch
+# build - they ship the same `onnxruntime` package and the last write wins,
+# which silently removes the GPU/NPU provider (seen in the field: the intel
+# branch verifying with only Azure+CPU providers). Detect and undo.
+$branchOrt = @{ amd = "onnxruntime-webgpu"; nvidia = "onnxruntime-gpu"; intel = "onnxruntime-openvino" }[$Hardware]
+if ($branchOrt -and (Get-PyPkgVersion "onnxruntime")) {
+    Step "Plain onnxruntime was pulled in over $branchOrt - reasserting $branchOrt..."
+    & $python -m pip uninstall -y onnxruntime | Out-Null
+    & $python -m pip install --force-reinstall --no-deps $branchOrt
+    if ($LASTEXITCODE -ne 0) { Fail "$branchOrt reinstall failed" }
+}
+
 # --- 6. Kokoro instant-TTS engine (installed without deps so its declared
 # onnxruntime dependency cannot clobber the branch's onnxruntime build) --------
 if (Get-PyPkgVersion "kokoro-onnx") {
