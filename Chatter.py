@@ -1,24 +1,29 @@
 import sys
 import os as _os_early
-# NLTK 3.10+ validates data paths against roots captured at import time, so
-# the project-local data dir must be registered via NLTK_DATA *before* nltk
-# is imported. Keeping the data in the project folder avoids Windows AppData
-# virtualization redirecting it somewhere the validator rejects.
+
 _NLTK_DIR = _os_early.path.join(_os_early.path.dirname(_os_early.path.abspath(__file__)), "nltk_data")
 _os_early.makedirs(_NLTK_DIR, exist_ok=True)
 _os_early.environ["NLTK_DATA"] = _NLTK_DIR + _os_early.pathsep + _os_early.environ.get("NLTK_DATA", "")
 
-# The app prints emoji and ANSI-colored debug lines; on Windows consoles that
-# default to cp1252 these raise UnicodeEncodeError. Force UTF-8 with safe
-# replacement so logging can never crash generation.
+
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
-            # line_buffering so progress is visible even when output is piped
+            
             _stream.reconfigure(encoding="utf-8", errors="replace",
                                 line_buffering=True)
         except Exception:
             pass
+
+
+import warnings
+warnings.filterwarnings("ignore", message=".*HTTP_422_UNPROCESSABLE_ENTITY.*")
+warnings.filterwarnings("ignore", message=r".*sdp_kernel\(\).*")
+warnings.filterwarnings("ignore", message=".*LoRACompatibleLinear.*")
+warnings.filterwarnings("ignore", message=".*past_key_values.*")
+warnings.filterwarnings("ignore", message=".*CUBLASLT workspace size.*")
+
+_os_early.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import random
 import numpy as np
@@ -37,10 +42,7 @@ import string
 import difflib
 import time
 import gc
-# Heavy, deferred imports (each costs seconds at startup and none is needed
-# to serve the web page): chatterbox model code, whisper backends, and nltk
-# are imported inside the functions that use them, so the site binds fast
-# while the model loads in the background.
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import csv
@@ -54,9 +56,6 @@ except Exception:
     _PYRNNOISE_AVAILABLE = False
 
 
-# torchaudio 2.9 removed its built-in file I/O (torchaudio.save/load now
-# require the separate torchcodec package, which the ROCm build doesn't
-# bundle). Use soundfile for wav I/O instead — no codec stack needed.
 def save_audio(path, tensor, sample_rate):
     data = tensor.detach().cpu().numpy()
     if data.ndim == 2:
@@ -68,7 +67,7 @@ def load_audio(path):
     return torch.from_numpy(data.T), sample_rate
 
 SETTINGS_PATH = "settings.json"
-#THIS IS THE START
+
 def load_settings():
     if os.path.exists(SETTINGS_PATH):
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
@@ -83,7 +82,7 @@ def load_settings():
         return default_settings()
 
 def save_settings(mapping):
-    # Ensure "whisper_model_dropdown" is always saved as the label, not code
+    
     whisper_model_map = {
         "tiny (~1 GB VRAM OpenAI / ~0.5 GB faster-whisper)": "tiny",
         "base (~1.2–2 GB OpenAI / ~0.7–1 GB faster-whisper)": "base",
@@ -96,7 +95,7 @@ def save_settings(mapping):
         label = next((k for k, code in whisper_model_map.items() if code == v), v)
         mapping["whisper_model_dropdown"] = label
 
-    # --- Add the extra "per-generation" fields for full compatibility ---
+    
     if "input_basename" not in mapping:
         mapping["input_basename"] = "text_input_"
     if "audio_prompt_path_input" not in mapping:
@@ -111,10 +110,7 @@ def save_settings(mapping):
         json.dump(mapping, f, indent=2, ensure_ascii=False)
         
 def save_settings_csv(settings_dict, output_audio_files, csv_path):
-    """
-    Save a dict of settings and a list of output audio files to a one-row CSV.
-    """
-    # Prepare a flattened settings dict for CSV
+
     flat_settings = {}
     for k, v in settings_dict.items():
         if isinstance(v, (list, tuple)):
@@ -128,16 +124,12 @@ def save_settings_csv(settings_dict, output_audio_files, csv_path):
         writer.writerow(flat_settings)
 
 def save_settings_json(settings_dict, json_path):
-    """
-    Save the settings dict as a JSON file.
-    """
+
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(settings_dict, f, indent=2, ensure_ascii=False)
         
-        
-# === VC TAB (NEW) ===
 
-VC_MODEL = None  # Reuse the global DEVICE defined earlier
+VC_MODEL = None 
 
 def get_or_load_vc_model():
     global VC_MODEL
@@ -171,7 +163,6 @@ def voice_conversion(input_audio_path, target_voice_audio_path, chunk_sec=60, ov
         out_wav = wav_out.squeeze(0).numpy()
         return model_sr, out_wav
 
-    # chunking logic for long files
     chunk_samples = int(chunk_sec * model_sr)
     overlap_samples = int(overlap_sec * model_sr)
     step_samples = chunk_samples - overlap_samples
@@ -192,7 +183,6 @@ def voice_conversion(input_audio_path, target_voice_audio_path, chunk_sec=60, ov
         out_chunks.append(out_chunk_np)
         os.remove(temp_chunk_path)
 
-    # Crossfade join as before...
     result = out_chunks[0]
     for i in range(1, len(out_chunks)):
         overlap = min(overlap_samples, len(out_chunks[i]), len(result))
@@ -262,9 +252,7 @@ In the Land of Mordor where the Shadows lie.""",
         
 settings = load_settings()
 
-# nltk costs ~4s to import, so it is loaded lazily on first sentence split.
-# NLTK_DATA (set at the very top of this file) points at the project-local
-# nltk_data dir, so downloads land there and the path validator accepts it.
+
 _NLTK_READY = False
 
 def _sent_tokenize(text):
@@ -286,10 +274,7 @@ def _sent_tokenize(text):
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 
-# Select device: NVIDIA CUDA or AMD ROCm GPU (both surface as "cuda"),
-# Apple Silicon GPU (MPS) if available, else fallback to CPU.
-# AMD GPUs (e.g. Ryzen AI MAX+ / Radeon) use ROCm builds of PyTorch, which
-# expose the GPU through the torch.cuda API — torch.version.hip tells them apart.
+
 if torch.cuda.is_available():
     DEVICE = "cuda"
 elif torch.backends.mps.is_available():
@@ -301,10 +286,9 @@ IS_ROCM = (DEVICE == "cuda") and (getattr(torch.version, "hip", None) is not Non
 
 if DEVICE == "cuda":
     _backend = f"ROCm/HIP {torch.version.hip}" if IS_ROCM else f"CUDA {torch.version.cuda}"
-    print(f"🚀 Running on device: {DEVICE} ({torch.cuda.get_device_name(0)}, {_backend})")
+    print(f"Running on device: {DEVICE} ({torch.cuda.get_device_name(0)}, {_backend})")
 else:
-    print(f"🚀 Running on device: {DEVICE}")
-# ---- Determinism (CUDA / PyTorch) ----
+    print(f"Running on device: {DEVICE}")
 import os as _os, torch as _torch
 _torch.backends.cudnn.benchmark = False
 if hasattr(_torch.backends.cudnn, "deterministic"):
@@ -320,14 +304,8 @@ if DEVICE == "cuda":
 # --------------------------------------
 
 MODEL = None
-MODEL_ENGINE = None  # engine the currently loaded MODEL belongs to
-MODEL_KEY = None     # (engine, model, precision) of the resident model
-# Exactly one TTS model lives in memory at a time: switching engines evicts
-# the previous one and loads the new one from the on-disk cache. Weights are
-# downloaded once; the Hugging Face cache only re-downloads a file when the
-# published version actually changes.
-
-# ---- Inference engine selection (PyTorch vs ONNX Runtime) ----
+MODEL_ENGINE = None 
+MODEL_KEY = None     
 TTS_ENGINE_CHOICES = {
     "PyTorch (CUDA / ROCm GPU)": "pytorch",
     "ONNX Runtime (NPU / DirectML / CPU)": "onnx",
@@ -501,9 +479,7 @@ def load_whisper_backend(model_name, use_faster_whisper, device):
     """
     if use_faster_whisper:
         from faster_whisper import WhisperModel as FasterWhisperModel
-        _free_vram()  # free memory before constructing Faster-Whisper
-        # On AMD (ROCm) builds, CTranslate2's ROCm wheel accepts device="cuda"
-        # exactly like NVIDIA, so the same ladder applies on both vendors.
+        _free_vram()  
         if device == "cuda":
             candidates = ["float16", "int8_float16", "int8"]
         else:
@@ -525,7 +501,7 @@ def load_whisper_backend(model_name, use_faster_whisper, device):
     else:
         import whisper
         print(f"[DEBUG] Loading openai-whisper model: {model_name}")
-        _free_vram()  # also free before OpenAI-whisper to reduce fragmentation
+        _free_vram() 
         return whisper.load_model(model_name, device=device)
 
 
@@ -537,8 +513,7 @@ def get_cached_whisper(model_name, use_faster_whisper, device):
     like a re-download and wasted ~30s+ per run."""
     key = (model_name, bool(use_faster_whisper), device)
     if key not in WHISPER_CACHE:
-        # Only keep one whisper variant resident; evict others when the user
-        # changes the model size or backend.
+       
         WHISPER_CACHE.clear()
         _free_vram()
         WHISPER_CACHE[key] = load_whisper_backend(model_name, use_faster_whisper, device)
@@ -549,7 +524,7 @@ def get_cached_whisper(model_name, use_faster_whisper, device):
 import threading as _threading
 _MODEL_LOCK = _threading.Lock()
 
-# Backend state shown by the status bar at the top of the web page.
+
 _APP_STATUS = {"phase": "Starting up...", "busy": True, "error": False,
                "since": time.time()}
 
@@ -571,8 +546,7 @@ def _status_bar_html():
                  'border-radius:4px;animation:cbx-slide 1.2s linear '
                  'infinite;"></div>')
     elif elapsed < 8:
-        # Show the green confirmation briefly, then vanish entirely —
-        # the bar only exists while there is something to report.
+       
         icon, text = "✅", f"{st['phase']}"
         inner = ('<div style="height:100%;width:100%;'
                  'background:#16a34a;"></div>')
@@ -898,8 +872,6 @@ def live_tts_speakers(text, audio_prompt_path, exaggeration, temperature, cfg_we
         audio_prompt_path = None
     audio_prompt_path = _effective_audio_prompt(audio_prompt_path)
 
-    # Show a status line BEFORE the model load: switching engines reloads the
-    # model, which takes tens of seconds — without this the press looks dead.
     yield "Preparing the TTS engine (an engine switch can take a minute)..."
     model = get_or_load_model()
     loud_target = _loudness_target(audio_prompt_path)
@@ -991,9 +963,6 @@ def live_tts_speakers(text, audio_prompt_path, exaggeration, temperature, cfg_we
                 out_stream.write(data[off:off + block])
             played += len(data) / sr
 
-        # Pre-buffer ~2s of audio before the first write: generation runs
-        # slightly faster than playback, so a small head start means the
-        # buffer only ever grows — no mid-speech pauses.
         PREBUFFER_SEC = 2.0
         pending, buffered, started, ended = [], 0.0, False, False
         while not stop.is_set():
@@ -1055,17 +1024,11 @@ def live_tts_stream(text, audio_prompt_path, exaggeration, temperature, cfg_weig
     base_seed = int(seed) if seed and int(seed) != 0 else random.randint(1, 2**31 - 1)
     print(f"[LIVE] Streaming {len(groups)} chunk(s) (base seed {base_seed})")
 
-    # The PyTorch engine samples with the generator on the model's device;
-    # the ONNX engine only reads the seed. Match the device like the file
-    # pipeline does or torch.multinomial rejects the generator.
+
     model_device = str(getattr(model, "device", "cpu"))
     gen_device = "cuda" if (torch.cuda.is_available() and model_device == "cuda") else "cpu"
     sr = model.sr
 
-    # Producer thread generates sentences while the consumer below paces the
-    # stream against a playback clock. If generation momentarily falls behind
-    # playback, short keep-alive silences are yielded so the browser player
-    # never underruns (an underrun stops playback for good).
     import queue as _queue
     import threading as _threading
     chunk_queue = _queue.Queue(maxsize=4)
@@ -1250,15 +1213,13 @@ def _apply_pyrnnoise_in_place(wav_output_path):
 
 def get_wav_duration(path):
     try:
-        return librosa.get_duration(filename=path)
+        return librosa.get_duration(path=path)
     except Exception as e:
         print(f"[ERROR] librosa.get_duration failed: {e}")
         return float('inf')
 
 def normalize_for_compare_all_punct(text):
-    # Fold pronunciation respellings ("wined" -> "wind") back to normal
-    # spelling on BOTH sides of the Whisper comparison, so forcing a
-    # pronunciation never causes a false validation mismatch.
+
     try:
         import pronunciation
         text = pronunciation.canonicalize(text)
@@ -1323,13 +1284,8 @@ def smart_remove_sound_words(text, sound_words):
                 flags=re.IGNORECASE
             )
 
-    # --- Fix accidental joining of words caused by quote removal ---
-    # Add a space if a letter is next to a letter and was separated by removed quote
-    #text = re.sub(r'(\w)([’\'"“”‘’])(\w)', r'\1 \3', text)
-    # Add a space between lowercase and uppercase, likely joined words (e.g., rainbowPride)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
 
-    # --- Clean up doubled-up commas and extra spaces ---
     text = re.sub(r'([,\s]+,)+', ',', text)
     text = re.sub(r',\s*,+', ',', text)
     text = re.sub(r'\s{2,}', ' ', text)
@@ -1595,10 +1551,6 @@ def generate_batch_tts(
     audio_prompt_path_input = _effective_audio_prompt(audio_prompt_path_input)
     model = get_or_load_model()
 
-    # PATCH: Get file basename (to prepend) if a text file was uploaded
-    # Support for multiple file uploads
-    # PATCH: Get file basename (to prepend) if a text file was uploaded
-    # Support for multiple file uploads
     input_basename = ""
 
     # Robust handling for Gradio's file input (can be None, False, or list containing such)
@@ -1730,7 +1682,6 @@ def process_text_for_tts(
     if not text or len(text.strip()) == 0:
         raise ValueError("No text provided.")
     
-    # ---- NEW: Apply sound word removals/replacements ----
     if sound_words_field and sound_words_field.strip():
         sound_words = parse_sound_word_field(sound_words_field)
         if sound_words:
@@ -1781,7 +1732,7 @@ def process_text_for_tts(
     sentence_groups = None
     if enable_batching:
         sentence_groups = group_sentences(sentences, max_chars=300)
-        if smart_batch_short_sentences:  # NEW: now works as post-processing!
+        if smart_batch_short_sentences:
             sentence_groups = enforce_min_chunk_length(sentence_groups)
     elif smart_batch_short_sentences:
         sentence_groups = smart_append_short_sentences(sentences)
@@ -1800,9 +1751,8 @@ def process_text_for_tts(
         print(f"\033[43m[DEBUG] Starting generation {gen_index+1}/{num_generations} with seed {this_seed}\033[0m")
 
         chunk_candidate_map = {}
-        waveform_list = []  # Initialize waveform_list here to ensure it’s defined
+        waveform_list = [] 
 
-        # -------- CHUNK GENERATION --------
         if enable_parallel:
             total_chunks = len(sentence_groups)
             completed = 0
@@ -1832,7 +1782,6 @@ def process_text_for_tts(
                 )
                 chunk_candidate_map[idx] = candidates
 
-        # -------- WHISPER VALIDATION --------
         if not bypass_whisper_checking:
             print(f"\033[32m[DEBUG] Validating all candidates with Whisper for all chunks (sequentially)...\033[0m")
 
@@ -1944,9 +1893,7 @@ def process_text_for_tts(
                     else:
                         print(f"[ERROR] No candidates were generated for chunk {chunk_idx}.")
             finally:
-                # The Whisper model stays cached (see get_cached_whisper) so
-                # the next generation reuses it instead of reloading gigabytes
-                # from disk every run. Unified memory makes this cheap.
+
                 gc.collect()
         else:
             # Bypass Whisper: pick shortest duration per chunk
@@ -2006,7 +1953,7 @@ def process_text_for_tts(
                     auto_editor_input = wav_output
 
                 auto_editor_cmd = [
-                    "auto-editor",
+                    sys.executable, "-m", "auto_editor",
                     "--edit", f"audio:threshold={ae_threshold}",
                     "--margin", f"{ae_margin}s",
                     "--export", "audio",
@@ -2058,8 +2005,7 @@ def process_text_for_tts(
             except Exception as e:
                 print(f"[ERROR] Could not remove temp wav file: {e}")
                 
-            # === Save settings CSV and JSON for this generation ===
-        # Only include relevant fields and NOT the raw text_input
+
         settings_to_save = {
             "text_input": "",  # Intentionally blank for privacy
             "exaggeration_slider": exaggeration_input,
@@ -2310,7 +2256,7 @@ def _build_pron_picker(textbox):
                         outputs=[pron_state, pron_status, pron_choice])
 
 
-def main(server_name=None, server_port=None, share=False):
+def main(server_name=None, server_port=None, share=False, inbrowser=False):
     print("[UI] Building the web interface — this is the quiet part of "
           "startup and can take a minute. The app is ready when the "
           "'Running on local URL' line appears.", flush=True)
@@ -3203,6 +3149,7 @@ def main(server_name=None, server_port=None, share=False):
             server_name=server_name,
             server_port=server_port,
             share=share,
+            inbrowser=inbrowser,
         )
 
 if __name__ == "__main__":
@@ -3212,6 +3159,8 @@ if __name__ == "__main__":
     parser.add_argument("--share", action="store_true", help="Enable Gradio share link")
     parser.add_argument("--public", action="store_true",
                         help="Shortcut for --host 0.0.0.0 (bind all interfaces)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Open the web client in your browser automatically once the server is up")
 
     args = parser.parse_args()
 
@@ -3219,4 +3168,4 @@ if __name__ == "__main__":
     if args.public and not args.host:
         args.host = "0.0.0.0"
 
-    main(server_name=args.host, server_port=args.port, share=args.share)
+    main(server_name=args.host, server_port=args.port, share=args.share, inbrowser=args.auto)
