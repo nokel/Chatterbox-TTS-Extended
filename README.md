@@ -63,10 +63,20 @@ sensitive runtimes — CPU torch (~200 MB), PyPI CTranslate2, PyPI
 onnxruntime (~15 MB) — and runs real computations on them. A broken
 Python/pip/network/VC-runtime setup fails in minutes, not after 15 GB.
 
-Everything else: Python 3.12 and FFmpeg are auto-installed via winget if
-missing; steps already satisfied are skipped on re-runs; the install ends
+Everything else: Python 3.12 and FFmpeg are auto-installed if missing
+(via winget, or straight from python.org / gyan.dev on machines without
+winget — with progress bars either way); steps already satisfied are
+skipped on re-runs, and a `.venv-amd` left broken by a machine move or a
+Python uninstall is detected and rebuilt automatically. The install ends
 with a hardware-appropriate verification (`verify.py`) that actually
-exercises the GPU/provider rather than just importing packages.
+exercises the GPU/provider rather than just importing packages, then
+offers to launch the app right away (`y`/`n`/`a` — `a` launches with
+`--auto` so the browser opens itself).
+
+Every install run is fully logged to `install.log` (pip output included),
+and failure messages point there. The installer also strips Windows'
+"downloaded from the internet" mark from the project's scripts, so
+`run.ps1` doesn't trigger a security prompt on every launch.
 
 AMD support covers the Ryzen AI MAX+ 395 "Strix Halo" (gfx1151) and recent
 Radeon RX 7000/9000 GPUs — see AMD's
@@ -76,18 +86,24 @@ branch.
 
 ## Running
 
-Right-click `run_amd.ps1` → **Run with PowerShell** (the name is historical —
-it launches the app on every hardware branch), or from a terminal:
+Right-click `run.ps1` → **Run with PowerShell**, or from a terminal:
 
 ```powershell
-.\run_amd.ps1
+./run.ps1 --auto
 ```
 
-The web page opens within a few seconds; the TTS model loads in the
+The webclient will be accessible within a few seconds by typing in
+`localhost:7860` in your browser — with `--auto` a browser window opens
+there automatically. The TTS model loads in the
 background. A loading bar at the top of the page shows what is happening
 ("Loading TTS engine", "Compiling GPU kernels") with elapsed time, turns
 green when everything is warmed (~25 s cold), then hides itself. Requests
 made before that simply wait for the load to finish.
+
+Other options are passed through to the app: `--host 0.0.0.0` (listen on
+all interfaces), `--port 7861`, `--share` (public Gradio link). Every
+launch is logged to `run.log` (overwritten per run); if the app exits
+with an error, the script says so and points at the log.
 
 ---
 
@@ -336,6 +352,14 @@ implements the `torch.cuda` API, so the app reports e.g.
 
 ## Tips & troubleshooting
 
+- **Install failed?** The full log of the run is in `install.log` next to
+  the script — include it when reporting an issue. App crashes land in
+  `run.log` the same way.
+- **"Do you want to run this software?" on every launch** — Windows marks
+  browser-downloaded scripts. Run `install.ps1` once (it unblocks the
+  project's scripts) or `Unblock-File .\run.ps1`.
+- **Moved the folder to another PC?** Just run `install.ps1` there — it
+  detects the broken venv and rebuilds everything that machine needs.
 - **Background noise in output?** Enable pyrnnoise denoising (runs before
   Auto-Editor and normalization).
 - **Out of VRAM or slow?** Lower parallel workers, pick a smaller Whisper
