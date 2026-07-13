@@ -124,9 +124,7 @@ the PyTorch/ROCm engine — the stream keeps pace with playback.)
 Selectable at the top of the page:
 
 - **PyTorch (CUDA / ROCm GPU)** — the default engine.
-- **ONNX Runtime (NPU / OpenVINO / WebGPU / CPU)** — runs the official
-  [chatterbox-ONNX](https://huggingface.co/onnx-community/chatterbox-ONNX)
-  export. Providers are probed in order **VitisAI (Ryzen AI NPU) →
+- **ONNX Runtime (NPU / OpenVINO / WebGPU / CPU)** — Providers are probed in order **VitisAI (Ryzen AI NPU) →
   OpenVINO (Intel CPU/GPU/NPU) → WebGPU (DirectX 12) → CPU**, dropping down
   automatically when a component fails validation on the actual hardware.
   Two models:
