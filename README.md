@@ -1,4 +1,4 @@
-# Chatterbox-TTS-Extended — AMD-ready fork with voice training & a Discord voice bot
+# Chatterbox-TTS-Extended — ONNX fork addition with voice training & a Discord voice bot
 
 A *power-user TTS pipeline* for advanced single and batch speech synthesis,
 voice conversion, and artifact-reduced audio generation, based on
