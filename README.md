@@ -353,83 +353,85 @@ seconds after joining while the encryption group finishes its handshake.
 
 ## Audiobook reader (PDF → audiobook)
 
-Turns a PDF ebook into a multi-voice audiobook, read aloud live with the
-text highlighted as it is spoken — like a screen reader, but with a cast.
+Turns a PDF ebook into a multi-voice audiobook: **open a PDF in SumatraPDF
+and click Read Aloud** — it reads the whole book with a different trained
+voice per character and highlights the words as they're spoken, inside
+SumatraPDF's own window. Like a screen reader, but with a cast.
 
-```powershell
-.\run_tts_server.ps1     # voices (always needed)
-.\run_audiobook.ps1      # the reader window (optionally: .\run_audiobook.ps1 book.pdf)
-```
+The Read Aloud button is a **setting**: it uses either the built-in Windows
+TTS or the Chatterbox audiobook engine, your choice — no extra button, no
+second window.
 
-**How it works**
+### One-time setup
 
-1. **Open a PDF.** The reader extracts every word with its position on the
-   page and splits the text into narration and quoted dialogue.
-2. **Analyze characters** (needs LM Studio's local server with a model
-   loaded, same as the Discord bot). The language model reads the entire
-   book in order, works out who speaks every quoted line, discovers the
-   character roster as it goes, and merges duplicate names at the end.
-   Nothing is written next to your book — the analysis is cached in
-   `audiobook/cache/` keyed by the file's hash, so re-opening is instant.
-3. **Cast voices.** Every character found in the book appears in the Cast
-   panel with a line count; pick a trained voice for each. Everything that
-   isn't a character line is read by the **Narrator** voice (any voice you
-   like), and so are lines whose speaker the model couldn't identify.
-4. **Play.** Click any sentence to start reading from there. The words
-   being spoken are highlighted and the page turns automatically. The next
-   few lines are synthesized ahead in the background while the current one
-   plays, and the reader tells the TTS server the book's cast up front so
-   the [voice router](#headless-tts-api-server) keeps the narrator pinned
-   and each character's voice warmed *before* its first line — switching
-   speakers never stalls on a model load.
+1. **Build the patched SumatraPDF** — `.\build_sumatra.ps1` (needs VS 2022
+   Build Tools; the script says so if they're missing). This produces
+   `..\sumatrapdf\out\dbg64\SumatraPDF-dll.exe`, a SumatraPDF fork with an
+   `Audiobook` settings section and the Read Aloud engine hook.
+2. **Point SumatraPDF at this install** — `.\setup_audiobook.ps1`. It
+   auto-detects this folder and its venv Python, finds
+   `SumatraPDF-settings.txt`, and writes an `Audiobook` block with
+   `UseChatterbox = true`. (Run `.\setup_audiobook.ps1 -Windows` to switch
+   Read Aloud back to Windows TTS; or just edit the setting.)
 
-**Voice Lab** (button in the toolbar) is where character voices are made
-and tuned:
+That's it. Open any PDF in that SumatraPDF and press **Read Aloud** (the
+speaker icon in the toolbar). Press it again to stop.
+
+### What happens on click
+
+SumatraPDF launches the headless engine ([audiobook/engine.py](audiobook/engine.py)),
+which:
+
+1. **Starts the TTS server** if it isn't already running.
+2. **Works out who speaks each line.** An LLM (LM Studio, any
+   OpenAI-compatible local server) reads the book once, attributes every
+   quoted line to a character, and discovers the cast. The result is cached
+   in `audiobook/cache/` by file hash, so it's a one-time cost per book.
+   **No LM Studio? It still works** — the whole book is read in the
+   narrator voice.
+3. **Casts voices.** The narrator (most of the book) gets one voice;
+   characters get the others. A saved casting is reused; anything unset is
+   auto-assigned and saved so it's stable.
+4. **Reads everything** — narration in the narrator voice, quotes in their
+   character voices — while the [voice router](#headless-tts-api-server)
+   keeps the narrator pinned and warms each character's voice *before* its
+   first line, so switching speakers never stalls on a model load. The
+   spoken words highlight in SumatraPDF and pages turn on their own.
+
+The `Audiobook` settings (SumatraPDF-settings.txt): `UseChatterbox`,
+`ChatterboxDir`, `PythonExe`, `TtsServerPort`, `LmStudioUrl`,
+`NarratorVoice` (empty = first available voice).
+
+### Making & tuning character voices — Voice Lab
+
+Character voices are made and refined in **Voice Lab**, opened from the
+helper window (`.\run_audiobook.ps1` → **Voice Lab…**):
 
 - **Train a new voice from recordings** — the same VAD + Whisper + LoRA
-  fine-tuning pipeline as the web app's Voice Training tab, driven from
-  the reader.
-- **Wave match** — the tuner clones the *reference speaker's own
-  passages* across a grid of generation settings and measures every
-  candidate's waveform against the real recording: speaker-embedding
-  similarity (chatterbox's own voice encoder), long-term spectrum
-  (timbre), and pitch statistics. The program picks the test passages and
-  the winning settings — not the ear of whoever is training. The real
-  recording's wave trace and the clone's are drawn overlaid so you can
-  see how closely they line up, and one click applies the winning
-  settings to that character.
-- **Test voice** — reads one or two of that character's actual lines
-  from the book so you hear the voice in context before committing.
+  fine-tuning pipeline as the web app's Voice Training tab.
+- **Wave match** — the tuner clones the *reference speaker's own passages*
+  across a grid of generation settings and measures every candidate's
+  waveform against the real recording: speaker-embedding similarity
+  (chatterbox's own voice encoder), long-term spectrum (timbre), and pitch.
+  The program picks the passages and the winning settings — not the ear of
+  whoever is training — and draws the real-vs-clone wave traces overlaid;
+  one click applies the winner to that character.
+- **Test voice** — reads one or two of that character's actual lines so you
+  hear the voice in context.
 
-**SumatraPDF integration — the real one.** Stock SumatraPDF has no plugin
-API, so this project carries a **patched SumatraPDF fork** (`sumatrapdf/`
-next to this repo) that adds two commands to Sumatra's DDE/command
-interface:
+### Under the hood
+
+The patched SumatraPDF adds two DDE commands the engine uses to paint the
+highlight (same mechanism Sumatra uses for LaTeX forward search):
 
 ```
 [AudiobookHighlight("<pdf>",<page>,"x0 y0 x1 y1;...")]   coordinates in PDF points
 [AudiobookClear("<pdf>")]
 ```
 
-They draw (and remove) a persistent highlight mark over arbitrary word
-rectangles and auto-scroll them into view — the same mechanism Sumatra
-uses for LaTeX forward search, repurposed so the audiobook reader can
-highlight the words being spoken *inside SumatraPDF's own window*, page
-turns included. Tick **Read in SumatraPDF** in the reader's toolbar and
-playback drives the patched Sumatra; the reader finds the patched build
-automatically (`sumatrapdf\out\dbg64\SumatraPDF-dll.exe`, override with
-env `CHATTERBOX_SUMATRA_EXE`). Rebuild it any time with
-`build_sumatra.ps1` (needs VS 2022 Build Tools; the script tells you if
-they're missing).
-
-For unpatched/stock SumatraPDF installs there is still the fallback:
-**Add to SumatraPDF** registers the reader as an external viewer in
-SumatraPDF's **File → Open With** menu (a backup of
-`SumatraPDF-settings.txt` is written next to the original).
-
-Requirements: the headless TTS server must be running for playback and
-wave matching; LM Studio (any OpenAI-compatible local server on port
-11434) only for the one-time character analysis of each book.
+(For a stock, unpatched SumatraPDF the helper window's **Add to SumatraPDF**
+button still registers the reader as an external viewer under
+**File → Open With** — the fallback before the fork existed.)
 
 ## AMD implementation notes
 
