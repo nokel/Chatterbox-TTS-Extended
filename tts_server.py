@@ -1,20 +1,24 @@
 # tts_server.py — headless Chatterbox TTS API server.
 #
-# Serves the trained voices in voices/ over HTTP so other programs (e.g. the
-# Discord voice bot) can synthesize speech without running the Gradio app.
+# Serves the trained voices in voices/ over HTTP so other programs (the
+# audiobook reader, the Discord voice bot) can synthesize speech without
+# running the Gradio app.
 #
-#   GET  /health  -> {"ok": true, "loaded_voice": "Trump" | null}
-#   GET  /voices  -> ["Trump", "Trump-paced", ...]
-#   POST /tts     -> WAV bytes (24 kHz mono 16-bit)
-#        body: {"text": "...", "voice": "Trump",
-#               "exaggeration": 0.5, "cfg_weight": 0.5,
-#               "temperature": 0.8, "seed": null}
+#   GET  /health -> {"ok": true, resident/pinned/capacity/stats, loaded_voice}
+#   GET  /voices -> ["Trump", "fallout_4", ...]
+#   POST /warm   -> {"voice": "...", "pin": false}  preload a voice into RAM
+#   POST /plan   -> {"narrator": "...", "voices": {"name": count, ...}}
+#                   set up residency for a whole book at once
+#   POST /tts    -> WAV bytes (24 kHz mono 16-bit)
+#        body: {"text": "...", "voice": "Trump", "exaggeration": 0.5,
+#               "cfg_weight": 0.5, "temperature": 0.8, "seed": null}
 #
-# A small LRU cache of voice models stays resident (default 3, override with
-# env CHATTERBOX_TTS_MAX_VOICES); the least recently used voice is evicted
-# when the cache is full. Output speech loudness is matched to the voice's
-# original training recordings (voices/<voice>/loudness.json), same as the
-# main app.
+# Voice residency is managed by a VoiceRouter (see below): the narrator is
+# pinned (loaded first, never evicted), character voices are loaded on
+# demand and can be *warmed* ahead of when they're needed so speaking never
+# stalls on a load; least-recently-used unpinned voices are evicted only
+# when the resident set exceeds a RAM-derived capacity. Output loudness is
+# matched to each voice's original training recordings.
 #
 # Run with run_tts_server.ps1 (listens on http://127.0.0.1:7861).
 
@@ -23,6 +27,8 @@ import os
 import re
 import sys
 import threading
+import time
+from collections import OrderedDict
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -43,11 +49,18 @@ MAX_CHUNK_CHARS = 250      # chatterbox is trained on short utterances
 GAIN_LIMIT_DB = 12.0
 PEAK_GUARD = 0.985
 
+# Residency sizing. A loaded voice model is ~2-2.5 GB. Capacity is derived
+# from free RAM (unified memory on APUs), leaving a reserve, and hard-capped
+# so a huge cast doesn't try to hold everything at once. Override the whole
+# thing with CHATTERBOX_TTS_MAX_VOICES (0 = auto).
+PER_VOICE_GB = float(os.environ.get("CHATTERBOX_VOICE_RAM_GB", "2.5"))
+RESERVE_GB = float(os.environ.get("CHATTERBOX_VOICE_RESERVE_GB", "12"))
+HARD_MAX_VOICES = int(os.environ.get("CHATTERBOX_VOICE_HARD_MAX", "12"))
+FORCED_MAX = int(os.environ.get("CHATTERBOX_TTS_MAX_VOICES", "0"))
+
 app = FastAPI(title="Chatterbox headless TTS")
 
-_LOCK = threading.Lock()
-_MODELS = {}          # voice name -> model, insertion order = LRU order
-_MAX_VOICES = max(1, int(os.environ.get("CHATTERBOX_TTS_MAX_VOICES", "3")))
+_GEN_LOCK = threading.Lock()   # serialize generation (one GPU job at a time)
 
 
 def list_voices():
@@ -60,26 +73,173 @@ def list_voices():
     return out
 
 
-def _get_model(voice):
-    """Load (or fetch cached) voice model, LRU-evicting. Caller holds _LOCK."""
-    if voice in _MODELS:
-        _MODELS[voice] = _MODELS.pop(voice)  # mark most recently used
-        return _MODELS[voice]
-    import torch
-    from chatterbox.src.chatterbox.tts import ChatterboxTTS
+def _auto_capacity():
+    if FORCED_MAX > 0:
+        return FORCED_MAX
+    try:
+        import psutil
+        avail_gb = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return 3
+    return max(2, min(HARD_MAX_VOICES, int((avail_gb - RESERVE_GB) / PER_VOICE_GB)))
 
-    while len(_MODELS) >= _MAX_VOICES:
-        old = next(iter(_MODELS))
-        print(f"[TTS] Evicting voice '{old}'")
-        del _MODELS[old]
-        torch.cuda.empty_cache()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[TTS] Loading voice '{voice}' on {device}...")
-    _MODELS[voice] = ChatterboxTTS.from_local(
-        os.path.join(VOICES_DIR, voice), device)
-    print(f"[TTS] Voice '{voice}' ready ({len(_MODELS)}/{_MAX_VOICES} resident)")
-    return _MODELS[voice]
+class VoiceRouter:
+    """Decides which voice models live in RAM.
+
+    - The narrator voice is pinned: loaded first and never evicted, because
+      it speaks most of the book and must always be ready.
+    - Other voices load on demand; warm() preloads one in the background so
+      the load overlaps the currently-playing line instead of stalling it.
+    - Loads are serialized and deduplicated (two requests for the same
+      not-yet-loaded voice share one load); generation runs under a separate
+      lock, so a voice can load *while* another voice is speaking.
+    - When the resident set exceeds capacity, the least-recently-used
+      *unpinned* voice is evicted.
+    """
+
+    def __init__(self):
+        self._models = OrderedDict()      # name -> model, front = LRU
+        self._pinned = set()
+        self._loading = {}                # name -> Event (in-flight load)
+        self._lock = threading.RLock()
+        self._load_lock = threading.Lock()
+        self._forced_cap = None
+        self.stats = {}                   # name -> {loads,last_load_sec,uses}
+
+    # -- capacity ---------------------------------------------------------
+    def capacity(self):
+        if self._forced_cap is not None:
+            return self._forced_cap
+        return _auto_capacity()
+
+    def set_capacity(self, n):
+        self._forced_cap = max(1, int(n))
+
+    # -- helpers ----------------------------------------------------------
+    def _device(self):
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _load_model(self, name):
+        """Actually load a voice model. Overridable for testing."""
+        from chatterbox.src.chatterbox.tts import ChatterboxTTS
+        return ChatterboxTTS.from_local(
+            os.path.join(VOICES_DIR, name), self._device())
+
+    def _stat(self, name):
+        return self.stats.setdefault(
+            name, {"loads": 0, "last_load_sec": None, "uses": 0})
+
+    def is_resident(self, name):
+        with self._lock:
+            return name in self._models
+
+    def pin(self, name):
+        with self._lock:
+            self._pinned.add(name)
+
+    # -- core: load / cache / evict --------------------------------------
+    def ensure(self, name):
+        """Return the model for `name`, loading synchronously if needed.
+        Deduplicates concurrent loads of the same voice."""
+        with self._lock:
+            if name in self._models:
+                self._models.move_to_end(name)
+                self._stat(name)["uses"] += 1
+                return self._models[name]
+            ev = self._loading.get(name)
+            mine = ev is None
+            if mine:
+                ev = self._loading[name] = threading.Event()
+
+        if not mine:                      # another thread is loading it
+            ev.wait()
+            with self._lock:
+                self._models.move_to_end(name)
+                self._stat(name)["uses"] += 1
+                return self._models[name]
+
+        try:
+            with self._load_lock:         # one heavy load at a time
+                t0 = time.time()
+                print(f"[router] loading '{name}' ...", flush=True)
+                model = self._load_model(name)
+                dt = time.time() - t0
+            with self._lock:
+                self._models[name] = model
+                self._models.move_to_end(name)
+                s = self._stat(name)
+                s["loads"] += 1
+                s["last_load_sec"] = round(dt, 2)
+                s["uses"] += 1
+                self._evict_locked()
+                print(f"[router] '{name}' ready in {dt:.1f}s "
+                      f"({len(self._models)}/{self.capacity()} resident, "
+                      f"pinned={sorted(self._pinned)})", flush=True)
+            return model
+        finally:
+            with self._lock:
+                self._loading.pop(name, None)
+            ev.set()
+
+    def _evict_locked(self):
+        import torch
+        cap = self.capacity()
+        for name in list(self._models.keys()):   # front = least recent
+            if len(self._models) <= cap:
+                break
+            if name in self._pinned:
+                continue
+            del self._models[name]
+            print(f"[router] evicted '{name}' (over capacity {cap})", flush=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def warm(self, name, pin=False):
+        """Ensure `name` is (being) loaded, in the background. Returns
+        'resident' if already loaded, else 'warming'."""
+        with self._lock:
+            if pin:
+                self._pinned.add(name)
+            if name in self._models:
+                return "resident"
+            already = name in self._loading
+        if not already:
+            threading.Thread(target=self._warm_worker, args=(name,),
+                             daemon=True, name=f"warm-{name}").start()
+        return "warming"
+
+    def _warm_worker(self, name):
+        try:
+            self.ensure(name)
+        except Exception as e:            # a bad voice shouldn't kill the server
+            print(f"[router] warm '{name}' failed: {e}", flush=True)
+
+    def plan(self, narrator, counts):
+        """Set up residency for a whole book: pin+load the narrator first,
+        then preload the most-used voices up to capacity."""
+        self.pin(narrator)
+        cap = self.capacity()
+        ordered = [narrator] + [
+            v for v, _ in sorted(counts.items(), key=lambda kv: -kv[1])
+            if v != narrator]
+        for v in ordered[:cap]:
+            self.warm(v, pin=(v == narrator))
+        return self.status()
+
+    def status(self):
+        with self._lock:
+            return {
+                "resident": list(self._models.keys()),
+                "pinned": sorted(self._pinned),
+                "loading": list(self._loading.keys()),
+                "capacity": self.capacity(),
+                "stats": self.stats,
+            }
+
+
+ROUTER = VoiceRouter()
 
 
 def _split_text(text):
@@ -121,16 +281,45 @@ class TTSRequest(BaseModel):
     seed: int | None = None
 
 
+class WarmRequest(BaseModel):
+    voice: str
+    pin: bool = False
+
+
+class PlanRequest(BaseModel):
+    narrator: str
+    voices: dict[str, int] = {}
+
+
 @app.get("/health")
 def health():
-    loaded = list(_MODELS)
-    return {"ok": True, "loaded_voices": loaded,
-            "loaded_voice": loaded[-1] if loaded else None}
+    st = ROUTER.status()
+    st["ok"] = True
+    st["loaded_voices"] = st["resident"]
+    st["loaded_voice"] = st["resident"][-1] if st["resident"] else None
+    return st
 
 
 @app.get("/voices")
 def voices():
     return list_voices()
+
+
+@app.post("/warm")
+def warm(req: WarmRequest):
+    if req.voice not in list_voices():
+        raise HTTPException(404, f"unknown voice '{req.voice}'")
+    state = ROUTER.warm(req.voice, pin=req.pin)
+    return {"voice": req.voice, "state": state, "status": ROUTER.status()}
+
+
+@app.post("/plan")
+def plan(req: PlanRequest):
+    have = set(list_voices())
+    if req.narrator not in have:
+        raise HTTPException(404, f"unknown narrator voice '{req.narrator}'")
+    counts = {v: c for v, c in req.voices.items() if v in have}
+    return ROUTER.plan(req.narrator, counts)
 
 
 @app.post("/tts")
@@ -143,8 +332,11 @@ def tts(req: TTSRequest):
 
     import torch
 
-    with _LOCK:
-        model = _get_model(req.voice)
+    # load (or wait for a warm already in flight) OUTSIDE the generation
+    # lock, so warming another voice doesn't block a voice that's speaking
+    model = ROUTER.ensure(req.voice)
+
+    with _GEN_LOCK:
         gen = None
         if req.seed is not None:
             gen = torch.Generator(device=model.device)
@@ -174,4 +366,5 @@ if __name__ == "__main__":
 
     print("[TTS] Starting headless TTS server on http://127.0.0.1:7861")
     print(f"[TTS] Voices available: {', '.join(list_voices()) or '(none)'}")
+    print(f"[TTS] Voice residency capacity: {ROUTER.capacity()}")
     uvicorn.run(app, host="127.0.0.1", port=7861, log_level="warning")

@@ -74,6 +74,32 @@ def synth_unit(text, params, tts_url=DEFAULT_TTS_URL, timeout=600):
     return x, sr
 
 
+def warm_voice(voice, pin=False, tts_url=DEFAULT_TTS_URL):
+    """Ask the server to preload a voice into RAM (non-blocking on the server)."""
+    try:
+        requests.post(tts_url.rstrip("/") + "/warm",
+                      json={"voice": voice, "pin": pin}, timeout=10)
+    except requests.RequestException:
+        pass
+
+
+def plan_book(narrator_voice, voice_counts, tts_url=DEFAULT_TTS_URL):
+    """Tell the server a book's voice usage so it pins the narrator and
+    preloads the most-used voices. voice_counts: {voice_name: n_units}."""
+    try:
+        requests.post(tts_url.rstrip("/") + "/plan",
+                      json={"narrator": narrator_voice,
+                            "voices": voice_counts}, timeout=15)
+    except requests.RequestException:
+        pass
+
+
+def unit_voice(casting, speaker):
+    """The voice name a speaker resolves to, or None."""
+    p = voice_params(casting, speaker)
+    return p["voice"] if p else None
+
+
 class Player:
     """Plays a sequence of units with prefetch, pause/resume and stop.
 
@@ -126,6 +152,7 @@ class Player:
         self._paused = threading.Event()
         self._q = queue.Queue(maxsize=PREFETCH)
         todo = units[start_index:]
+        self._send_plan(todo)
         tp = threading.Thread(target=self._prefetch, args=(todo,),
                               daemon=True, name="ab-prefetch")
         tb = threading.Thread(target=self._playback, daemon=True,
@@ -134,12 +161,36 @@ class Player:
         tp.start()
         tb.start()
 
+    def _send_plan(self, units):
+        """Tell the router the book's voice usage: pin the narrator, preload
+        the most-used voices. Fire-and-forget in a thread so we don't wait."""
+        narrator = (self.casting or {}).get("narrator", {}).get("voice")
+        if not narrator:
+            return
+        counts = {}
+        for u in units:
+            v = unit_voice(self.casting, u["speaker"])
+            if v:
+                counts[v] = counts.get(v, 0) + 1
+        threading.Thread(
+            target=plan_book, args=(narrator, counts, self.tts_url),
+            daemon=True, name="ab-plan").start()
+
     # ------------------------------------------------------------ workers --
     def _prefetch(self, units):
         try:
-            for u in units:
+            for i, u in enumerate(units):
                 if self._stop.is_set():
                     return
+                # warm-ahead: start loading the voice a few units out so a
+                # first-time voice is resident before we need to synth it
+                # (belt-and-braces on top of the book plan, for the case
+                # where capacity is too small to hold every voice at once)
+                ahead = units[i + PREFETCH] if i + PREFETCH < len(units) else None
+                if ahead is not None:
+                    v = unit_voice(self.casting, ahead["speaker"])
+                    if v:
+                        warm_voice(v, tts_url=self.tts_url)
                 params = voice_params(self.casting, u["speaker"])
                 if params is None:
                     self._q.put(("error", u, RuntimeError(

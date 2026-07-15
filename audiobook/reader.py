@@ -177,6 +177,9 @@ class ReaderApp:
             voices = local_voices()
             if voices:
                 self.casting["narrator"] = {"voice": voices[0]}
+        narrator_voice = self.casting.get("narrator", {}).get("voice")
+        if narrator_voice:
+            self._warm_narrator(narrator_voice)
         self.btn_analyze.configure(state="normal")
         self.btn_play.configure(state="normal")
         self.btn_stop.configure(state="normal")
@@ -264,6 +267,15 @@ class ReaderApp:
                 name, {})["voice"] = voice
         pdfbook.save_casting(self.pdf, self.casting)
         self.log(f"cast: {name} -> {voice}")
+        if name == NARRATOR and voice:
+            self._warm_narrator(voice)
+
+    def _warm_narrator(self, voice):
+        """Preload+pin the narrator as soon as it's known, so it's ready
+        first - it speaks most of the book."""
+        threading.Thread(
+            target=lambda: synth.warm_voice(voice, pin=True),
+            daemon=True, name="warm-narrator").start()
 
     # -------------------------------------------------------------- page --
     def goto_page(self, page_no):

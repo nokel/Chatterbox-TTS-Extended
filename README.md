@@ -222,14 +222,31 @@ with crossfades; pitch shift supported.
 `http://127.0.0.1:7861` — the trained voices without the web UI, for other
 programs (the Discord bot uses this):
 
-- `GET /health` — `{"ok": true, "loaded_voice": ...}`
+- `GET /health` — `{"ok": true, "resident": [...], "pinned": [...],
+  "capacity": N, "stats": {...}, "loaded_voice": ...}`
 - `GET /voices` — list trained voices
 - `POST /tts` `{"text", "voice", "exaggeration", "cfg_weight", "temperature",
   "seed"}` — returns a loudness-matched 24 kHz WAV
+- `POST /warm` `{"voice", "pin"}` — preload a voice into RAM in the background
+- `POST /plan` `{"narrator", "voices": {name: count}}` — set up residency for a
+  whole book at once (pin the narrator, preload the most-used voices)
 
-One voice model is resident at a time; requesting another voice swaps it.
-Cold first request ~30 s (model load), warm requests ~11 s per sentence on a
-Ryzen AI MAX+ 395.
+**Voice router (multi-voice residency).** A book has many voices; loading one
+cold takes ~5–10 s on a Ryzen AI MAX+ 395, so the server keeps several
+resident at once instead of swapping on every line. The router:
+
+- **pins the narrator** — loaded first and never evicted, since it speaks most
+  of the book;
+- **warms voices ahead of need** — the audiobook reader tells the server the
+  book's cast (`/plan`) and the next voice it will need (`/warm`), so a
+  character's model loads *while the previous line is still playing* — first
+  use never stalls;
+- **sizes itself to RAM** — capacity is derived from free memory (≈12 on a
+  96 GB machine, so a whole book's cast usually stays resident with no
+  churn); override with `CHATTERBOX_TTS_MAX_VOICES`;
+- **evicts least-recently-used** unpinned voices only when over capacity.
+
+Warm requests then run ~11 s per sentence with no load stall between speakers.
 
 ---
 
@@ -361,7 +378,10 @@ text highlighted as it is spoken — like a screen reader, but with a cast.
 4. **Play.** Click any sentence to start reading from there. The words
    being spoken are highlighted and the page turns automatically. The next
    few lines are synthesized ahead in the background while the current one
-   plays.
+   plays, and the reader tells the TTS server the book's cast up front so
+   the [voice router](#headless-tts-api-server) keeps the narrator pinned
+   and each character's voice warmed *before* its first line — switching
+   speakers never stalls on a model load.
 
 **Voice Lab** (button in the toolbar) is where character voices are made
 and tuned:
