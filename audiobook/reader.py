@@ -25,6 +25,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
 from audiobook import analyze, pdfbook, synth  # noqa: E402
+from audiobook.sumatra import SumatraBridge  # noqa: E402
 
 ZOOM = 2.0
 HL_FILL = "#ffd54a"
@@ -91,6 +92,14 @@ class ReaderApp:
             self.page_no + 1)).pack(side="left", padx=(0, 12))
         ttk.Button(top, text="Voice Lab...", command=self.open_voice_lab)\
             .pack(side="left")
+        self.bridge = SumatraBridge(log=self.log)
+        self.sumatra_var = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(top, text="Read in SumatraPDF",
+                             variable=self.sumatra_var,
+                             command=self._sumatra_toggled)
+        cb.pack(side="left", padx=(12, 0))
+        if not self.bridge.available:
+            cb.state(["disabled"])
         ttk.Button(top, text="Add to SumatraPDF",
                    command=self.register_sumatra).pack(side="right")
 
@@ -343,16 +352,28 @@ class ReaderApp:
         self.btn_play.configure(text="⏸ Pause")
         self.set_status("Reading...")
 
+    def _sumatra_toggled(self):
+        if self.sumatra_var.get() and self.pdf:
+            threading.Thread(target=self.bridge.open, args=(self.pdf,),
+                             daemon=True).start()
+
+    def _sumatra_send(self, fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
     def _unit_start(self, unit):
         self.current_unit = unit
         if unit["page"] != self.page_no:
             self.goto_page(unit["page"])
         else:
             self._draw_highlight(unit)
+        if self.sumatra_var.get() and self.bridge.available:
+            self._sumatra_send(self.bridge.highlight, self.pdf, unit)
 
     def _play_done(self, error):
         self.btn_play.configure(text="▶ Play")
         self.canvas.delete("hl")
+        if self.pdf and self.sumatra_var.get() and self.bridge.available:
+            self._sumatra_send(self.bridge.clear, self.pdf)
         if error:
             self.set_status(f"Playback stopped: {error}")
             messagebox.showerror("Playback error", str(error))
@@ -365,6 +386,8 @@ class ReaderApp:
             self.player = None
         self.btn_play.configure(text="▶ Play")
         self.canvas.delete("hl")
+        if self.pdf and self.sumatra_var.get() and self.bridge.available:
+            self._sumatra_send(self.bridge.clear, self.pdf)
 
     # --------------------------------------------------------- voice lab --
     def open_voice_lab(self):

@@ -381,11 +381,31 @@ and tuned:
 - **Test voice** — reads one or two of that character's actual lines
   from the book so you hear the voice in context before committing.
 
-**SumatraPDF integration.** SumatraPDF has no plugin API, so the reader
-hooks in through Sumatra's *external viewers* mechanism: press **Add to
-SumatraPDF** in the toolbar (with Sumatra closed) and "Audiobook Reader"
-appears in SumatraPDF's **File → Open With** menu for every PDF. A backup
-of `SumatraPDF-settings.txt` is written next to the original.
+**SumatraPDF integration — the real one.** Stock SumatraPDF has no plugin
+API, so this project carries a **patched SumatraPDF fork** (`sumatrapdf/`
+next to this repo) that adds two commands to Sumatra's DDE/command
+interface:
+
+```
+[AudiobookHighlight("<pdf>",<page>,"x0 y0 x1 y1;...")]   coordinates in PDF points
+[AudiobookClear("<pdf>")]
+```
+
+They draw (and remove) a persistent highlight mark over arbitrary word
+rectangles and auto-scroll them into view — the same mechanism Sumatra
+uses for LaTeX forward search, repurposed so the audiobook reader can
+highlight the words being spoken *inside SumatraPDF's own window*, page
+turns included. Tick **Read in SumatraPDF** in the reader's toolbar and
+playback drives the patched Sumatra; the reader finds the patched build
+automatically (`sumatrapdf\out\dbg64\SumatraPDF-dll.exe`, override with
+env `CHATTERBOX_SUMATRA_EXE`). Rebuild it any time with
+`build_sumatra.ps1` (needs VS 2022 Build Tools; the script tells you if
+they're missing).
+
+For unpatched/stock SumatraPDF installs there is still the fallback:
+**Add to SumatraPDF** registers the reader as an external viewer in
+SumatraPDF's **File → Open With** menu (a backup of
+`SumatraPDF-settings.txt` is written next to the original).
 
 Requirements: the headless TTS server must be running for playback and
 wave matching; LM Studio (any OpenAI-compatible local server on port
