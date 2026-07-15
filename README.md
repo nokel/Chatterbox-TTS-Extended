@@ -358,24 +358,52 @@ and click Read Aloud** — it reads the whole book with a different trained
 voice per character and highlights the words as they're spoken, inside
 SumatraPDF's own window. Like a screen reader, but with a cast.
 
-The Read Aloud button is a **setting**: it uses either the built-in Windows
-TTS or the Chatterbox audiobook engine, your choice — no extra button, no
-second window.
+The Read Aloud button uses either the built-in Windows TTS or the Chatterbox
+audiobook engine — your choice, flipped from a checkable menu item inside
+SumatraPDF (**Settings → Read Aloud with Chatterbox Voices**). No extra
+button, no second window, no config files.
 
-### One-time setup
+### Installing
 
-1. **Build the patched SumatraPDF** — `.\build_sumatra.ps1` (needs VS 2022
-   Build Tools; the script says so if they're missing). This produces
-   `..\sumatrapdf\out\dbg64\SumatraPDF-dll.exe`, a SumatraPDF fork with an
-   `Audiobook` settings section and the Read Aloud engine hook.
-2. **Point SumatraPDF at this install** — `.\setup_audiobook.ps1`. It
-   auto-detects this folder and its venv Python, finds
-   `SumatraPDF-settings.txt`, and writes an `Audiobook` block with
-   `UseChatterbox = true`. (Run `.\setup_audiobook.ps1 -Windows` to switch
-   Read Aloud back to Windows TTS; or just edit the setting.)
+The audiobook is a **patched build of SumatraPDF** (the fork in
+`..\sumatrapdf`). Install it like any Windows program:
 
-That's it. Open any PDF in that SumatraPDF and press **Read Aloud** (the
-speaker icon in the toolbar). Press it again to stop.
+> **Run `SumatraPDF-install.exe`** and click through it.
+
+It's SumatraPDF's own self-installing executable (the app and its libraries
+are embedded inside it as a compressed payload). It installs to Program
+Files with file associations, a Start-menu entry, and an uninstaller — no
+shell, no scripts, nothing to configure.
+
+**Then just use it:**
+
+1. Open any PDF in SumatraPDF.
+2. Tick **Settings → Read Aloud with Chatterbox Voices** (once).
+3. Press **Read Aloud** (the speaker icon in the toolbar). Press it again to
+   stop.
+
+SumatraPDF finds this Chatterbox folder by itself — the first time you read,
+it scans your Documents folder for `Chatterbox-TTS-Extended-main` (the one
+with `audiobook\engine.py`) and remembers the path. If it's installed
+somewhere unusual, set `ChatterboxDir` under **Settings → Advanced Options**.
+
+#### Building the installer from source
+
+`SumatraPDF-install.exe` is produced with SumatraPDF's **own build
+toolchain** (bun-driven — no PowerShell). One-time prerequisites:
+
+- **Visual Studio 2022 Build Tools** with *Desktop development with C++*
+  (`winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`)
+- **bun** (`winget install Oven-sh.Bun`)
+
+Then, from the `sumatrapdf` folder:
+
+```
+bun cmd/build-installer.ts     # -> out\rel64\SumatraPDF-install.exe
+```
+
+For a quick in-place debug build (run it without installing),
+`bun cmd/build.ts` writes `out\dbg64\SumatraPDF-dll.exe`.
 
 ### What happens on click
 
@@ -398,9 +426,10 @@ which:
    first line, so switching speakers never stalls on a model load. The
    spoken words highlight in SumatraPDF and pages turn on their own.
 
-The `Audiobook` settings (SumatraPDF-settings.txt): `UseChatterbox`,
-`ChatterboxDir`, `PythonExe`, `TtsServerPort`, `LmStudioUrl`,
-`NarratorVoice` (empty = first available voice).
+The `Audiobook` settings (SumatraPDF's **Settings → Advanced Options**):
+`UseChatterbox` (the menu toggle), `ChatterboxDir` (auto-detected),
+`PythonExe` (empty = the install's `.venv-amd` Python), `TtsServerPort`,
+`LmStudioUrl`, `NarratorVoice` (empty = first available voice).
 
 ### Making & tuning character voices — Voice Lab
 
