@@ -48,6 +48,17 @@ def tts_available(tts_url=DEFAULT_TTS_URL):
         return False
 
 
+def tts_health(tts_url=DEFAULT_TTS_URL):
+    """The server's /health, or None if nothing sane answers."""
+    try:
+        r = requests.get(tts_url.rstrip("/") + "/health", timeout=3)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
 def list_server_voices(tts_url=DEFAULT_TTS_URL):
     try:
         r = requests.get(tts_url.rstrip("/") + "/voices", timeout=5)

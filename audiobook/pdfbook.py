@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 
 import fitz  # PyMuPDF
 
@@ -60,19 +61,65 @@ def _page_words(page):
     return [([w[0], w[1], w[2], w[3]], w[4]) for w in words if w[4].strip()]
 
 
-def _paragraphs(page):
-    """Group a page's words into paragraphs using text blocks."""
-    words = page.get_text("words")
+def _lines(page):
+    """A page's words grouped into lines, in reading order.
+
+    Returns [(block_no, line_no, x0, top, [(rect, word), ...])].
+    """
+    words = [w for w in page.get_text("words") if w[4].strip()]
     words.sort(key=lambda w: (w[5], w[6], w[7]))
-    paras, cur, cur_block = [], [], None
+    out, cur, key = [], [], None
     for w in words:
-        if not w[4].strip():
-            continue
-        if cur_block is not None and w[5] != cur_block and cur:
+        k = (w[5], w[6])
+        if key is not None and k != key and cur:
+            out.append(cur)
+            cur = []
+        key = k
+        cur.append(w)
+    if cur:
+        out.append(cur)
+    return [(ln[0][5], ln[0][6], min(w[0] for w in ln), min(w[1] for w in ln),
+             [([w[0], w[1], w[2], w[3]], w[4]) for w in ln]) for ln in out]
+
+
+def _paragraphs(page):
+    """Group a page's words into paragraphs.
+
+    NOT by PDF text block: a block is a layout blob, and in a converted ebook
+    one block routinely swallows several real paragraphs. That matters more
+    than it sounds, because paragraph structure is the backbone of speaker
+    attribution in fiction - a new paragraph means a new speaker, and beats
+    and dialogue tags bind to the quote in their own paragraph. Merged
+    paragraphs put two speakers in one and the rules quietly invert.
+
+    Paragraphs are found the way a typesetter marks them: the first line is
+    indented past the body margin, or there is extra space above it. The body
+    margin is taken as the most common line start on the page, so it works
+    whatever the page's actual margins are.
+    """
+    lines = _lines(page)
+    if not lines:
+        return []
+
+    starts = [round(x0) for _, _, x0, _, _ in lines]
+    margin = Counter(starts).most_common(1)[0][0]
+
+    heights = [ln[-1][0][0][3] - ln[-1][0][0][1] for ln in lines]
+    line_h = sorted(heights)[len(heights) // 2] if heights else 12.0
+    indent_min = max(4.0, line_h * 0.6)     # a real indent, not jitter
+    gap_min = line_h * 1.6                  # blank-ish space above
+
+    paras, cur, prev_bottom, prev_block = [], [], None, None
+    for block, _line_no, x0, top, words in lines:
+        indented = x0 > margin + indent_min
+        gapped = prev_bottom is not None and (top - prev_bottom) > gap_min
+        new_block = prev_block is not None and block != prev_block
+        if cur and (indented or gapped or new_block):
             paras.append(cur)
             cur = []
-        cur_block = w[5]
-        cur.append(([w[0], w[1], w[2], w[3]], w[4]))
+        cur.extend(words)
+        prev_bottom = max(r[3] for r, _ in words)
+        prev_block = block
     if cur:
         paras.append(cur)
     return paras
@@ -181,3 +228,34 @@ def save_casting(pdf_path, data):
     p = os.path.join(cache_dir(pdf_path), "casting.json")
     with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+
+
+def load_progress(pdf_path):
+    """The unit to carry on from, as saved when reading was stopped."""
+    p = os.path.join(cache_dir(pdf_path), "progress.json")
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return int(json.load(f).get("unit", 0))
+        except (ValueError, OSError):
+            pass
+    return 0
+
+
+def save_progress(pdf_path, unit):
+    """Remember where reading stopped so Continue picks up there rather than
+    starting the book again."""
+    p = os.path.join(cache_dir(pdf_path), "progress.json")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"unit": int(unit)}, f)
+    except OSError:
+        pass
+
+
+def clear_progress(pdf_path):
+    p = os.path.join(cache_dir(pdf_path), "progress.json")
+    try:
+        os.remove(p)
+    except OSError:
+        pass

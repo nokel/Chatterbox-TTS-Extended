@@ -49,6 +49,30 @@ MAX_CHUNK_CHARS = 250      # chatterbox is trained on short utterances
 GAIN_LIMIT_DB = 12.0
 PEAK_GUARD = 0.985
 
+# Which engine synthesizes speech.
+#
+# "onnx" (default): the chatterbox-turbo ONNX model. Measured on this machine
+# (Radeon 8060S / gfx1151) it runs at RTF ~0.5 - about twice as fast as
+# realtime - so playback never has to wait for it. It clones a voice zero-shot
+# from a reference wav, so there are no multi-GB per-voice weights to load and
+# no load stall between characters.
+#
+# "pytorch": the per-voice fine-tuned weights (voices/<name>/t3_cfg.safetensors).
+# Higher fidelity to a trained voice, but measured at RTF 2-5x (i.e. 12-24s to
+# speak one sentence), which is far too slow to read a book aloud. Kept for the
+# Voice Lab, where training and A/B testing a voice is the point and latency
+# doesn't matter.
+ENGINE = os.environ.get("CHATTERBOX_AUDIOBOOK_ENGINE", "onnx").lower()
+
+# MIOpen on ROCm asks PyTorch for a conv workspace, gets 0 bytes back and falls
+# back to naive solvers, which is a large part of why the pytorch path is slow
+# (ROCm/rocm-libraries#4071 on gfx1151). FAST mode avoids that fallback.
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASETS_DIR = os.path.join(BASE_DIR, "datasets")
+REF_SECONDS = 15.0         # enough audio for a zero-shot clone
+
 # Residency sizing. A loaded voice model is ~2-2.5 GB. Capacity is derived
 # from free RAM (unified memory on APUs), leaving a reserve, and hard-capped
 # so a huge cast doesn't try to hold everything at once. Override the whole
@@ -71,6 +95,97 @@ def list_voices():
             if os.path.isfile(os.path.join(d, "t3_cfg.safetensors")):
                 out.append(name)
     return out
+
+
+def _dataset_dir_for(voice):
+    """The training-clip dir for a voice. Names don't always match case
+    (voice 'Trump' vs datasets/trump)."""
+    if not os.path.isdir(DATASETS_DIR):
+        return None
+    want = voice.lower()
+    for d in sorted(os.listdir(DATASETS_DIR)):
+        if d.lower() == want and os.path.isdir(os.path.join(DATASETS_DIR, d)):
+            return os.path.join(DATASETS_DIR, d)
+    return None
+
+
+def ensure_reference_wav(voice):
+    """Reference audio for the ONNX engine, which clones a voice from a wav
+    rather than loading trained weights. Prefers an existing reference, else
+    builds one once from the voice's own training clips."""
+    vdir = os.path.join(VOICES_DIR, voice)
+    p = os.path.join(vdir, "reference.wav")
+    if os.path.isfile(p):
+        return p
+
+    # Build from the voice's training clips in preference to loudness_probe.wav:
+    # the probe is only a few seconds of level-check audio, while the training
+    # set is the material the voice was actually made from.
+    ds = _dataset_dir_for(voice)
+    if not ds:
+        probe = os.path.join(vdir, "loudness_probe.wav")
+        return probe if os.path.isfile(probe) else None
+    clips = []
+    for root, _dirs, files in os.walk(ds):
+        for f in sorted(files):
+            if f.lower().endswith(".wav"):
+                clips.append(os.path.join(root, f))
+    if not clips:
+        probe = os.path.join(vdir, "loudness_probe.wav")
+        return probe if os.path.isfile(probe) else None
+
+    chunks, sr, total = [], None, 0.0
+    for c in clips:
+        try:
+            x, csr = sf.read(c, dtype="float32", always_2d=False)
+        except Exception:
+            continue
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        if sr is None:
+            sr = csr
+        elif csr != sr:
+            continue          # don't resample here; just skip odd rates
+        chunks.append(x)
+        total += len(x) / float(sr)
+        if total >= REF_SECONDS:
+            break
+    if not chunks:
+        return None
+
+    out = np.concatenate(chunks)[: int(REF_SECONDS * sr)]
+    os.makedirs(vdir, exist_ok=True)
+    path = os.path.join(vdir, "reference.wav")
+    sf.write(path, out, sr, subtype="PCM_16")
+    print(f"[onnx] built reference for '{voice}' from {len(chunks)} training "
+          f"clip(s) ({total:.1f}s) -> {path}", flush=True)
+    return path
+
+
+class OnnxEngine:
+    """One chatterbox-turbo model for every voice; voices differ only by the
+    reference wav passed per request, so switching character costs nothing."""
+
+    def __init__(self):
+        self._model = None
+        self._lock = threading.Lock()
+
+    def ready(self):
+        return self._model is not None
+
+    def model(self):
+        with self._lock:
+            if self._model is None:
+                from chatterbox_onnx import ChatterboxOnnxTTS
+                t0 = time.time()
+                print("[onnx] loading chatterbox-turbo ...", flush=True)
+                self._model = ChatterboxOnnxTTS.from_pretrained(
+                    lm_precision="q4", model_variant="chatterbox-turbo")
+                print(f"[onnx] ready in {time.time() - t0:.1f}s", flush=True)
+            return self._model
+
+
+ONNX = OnnxEngine()
 
 
 def _auto_capacity():
@@ -295,6 +410,10 @@ class PlanRequest(BaseModel):
 def health():
     st = ROUTER.status()
     st["ok"] = True
+    st["engine"] = ENGINE
+    if ENGINE == "onnx":
+        # one model serves every voice, so residency/eviction don't apply
+        st["model_ready"] = ONNX.ready()
     st["loaded_voices"] = st["resident"]
     st["loaded_voice"] = st["resident"][-1] if st["resident"] else None
     return st
@@ -309,6 +428,12 @@ def voices():
 def warm(req: WarmRequest):
     if req.voice not in list_voices():
         raise HTTPException(404, f"unknown voice '{req.voice}'")
+    if ENGINE == "onnx":
+        # nothing per-voice to load; make sure the one model and this voice's
+        # reference audio are ready so the first line doesn't pay for it
+        ensure_reference_wav(req.voice)
+        ONNX.model()
+        return {"voice": req.voice, "state": "ready", "status": {"engine": ENGINE}}
     state = ROUTER.warm(req.voice, pin=req.pin)
     return {"voice": req.voice, "state": state, "status": ROUTER.status()}
 
@@ -318,6 +443,13 @@ def plan(req: PlanRequest):
     have = set(list_voices())
     if req.narrator not in have:
         raise HTTPException(404, f"unknown narrator voice '{req.narrator}'")
+    if ENGINE == "onnx":
+        # one shared model: just build any missing reference audio up front
+        for v in [req.narrator] + list(req.voices):
+            if v in have:
+                ensure_reference_wav(v)
+        ONNX.model()
+        return {"engine": ENGINE, "narrator": req.narrator, "preloaded": ["(single model)"]}
     counts = {v: c for v, c in req.voices.items() if v in have}
     return ROUTER.plan(req.narrator, counts)
 
@@ -332,26 +464,51 @@ def tts(req: TTSRequest):
 
     import torch
 
-    # load (or wait for a warm already in flight) OUTSIDE the generation
-    # lock, so warming another voice doesn't block a voice that's speaking
-    model = ROUTER.ensure(req.voice)
+    if ENGINE == "onnx":
+        ref = ensure_reference_wav(req.voice)
+        if not ref:
+            raise HTTPException(
+                500, f"no reference audio for '{req.voice}' (looked in "
+                     f"voices/{req.voice} and datasets/)")
+        model = ONNX.model()
+        with _GEN_LOCK:
+            gen = None
+            if req.seed is not None:
+                gen = torch.Generator()
+                gen.manual_seed(req.seed)
+            pieces = []
+            for chunk in _split_text(text):
+                wav = model.generate(
+                    chunk,
+                    audio_prompt_path=ref,
+                    exaggeration=req.exaggeration,
+                    cfg_weight=req.cfg_weight,
+                    temperature=req.temperature,
+                    generator=gen,
+                )
+                pieces.append(wav.squeeze(0).cpu().numpy())
+            sr = model.sr
+    else:
+        # load (or wait for a warm already in flight) OUTSIDE the generation
+        # lock, so warming another voice doesn't block a voice that's speaking
+        model = ROUTER.ensure(req.voice)
 
-    with _GEN_LOCK:
-        gen = None
-        if req.seed is not None:
-            gen = torch.Generator(device=model.device)
-            gen.manual_seed(req.seed)
-        pieces = []
-        for chunk in _split_text(text):
-            wav = model.generate(
-                chunk,
-                exaggeration=req.exaggeration,
-                cfg_weight=req.cfg_weight,
-                temperature=req.temperature,
-                generator=gen,
-            )
-            pieces.append(wav.squeeze(0).cpu().numpy())
-        sr = model.sr
+        with _GEN_LOCK:
+            gen = None
+            if req.seed is not None:
+                gen = torch.Generator(device=model.device)
+                gen.manual_seed(req.seed)
+            pieces = []
+            for chunk in _split_text(text):
+                wav = model.generate(
+                    chunk,
+                    exaggeration=req.exaggeration,
+                    cfg_weight=req.cfg_weight,
+                    temperature=req.temperature,
+                    generator=gen,
+                )
+                pieces.append(wav.squeeze(0).cpu().numpy())
+            sr = model.sr
 
     x = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
     x = _match_loudness(x, sr, get_voice_loudness(req.voice))
