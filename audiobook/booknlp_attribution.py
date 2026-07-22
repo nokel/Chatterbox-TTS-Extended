@@ -40,6 +40,87 @@ csv.field_size_limit(10 ** 7)
 PRONOUNS = {"he", "she", "they", "him", "her", "them", "i", "you", "we", "it",
             "someone", "somebody", "who", "that", "this"}
 
+SPEAK_VERBS = set((
+    "say said says asked ask replied reply answered answer shouted whispered "
+    "muttered called adds added cried snapped murmured breathed hissed barked "
+    "growled roared continued offered admitted agreed insisted repeated began "
+    "told demanded observed noted remarked responded countered urged warned "
+    "pleaded sighed laughed spat drawled wondered screamed yelled gasped "
+    "mumbled stammered exclaimed announced").split())
+
+_HONORIFICS = {"mr", "mrs", "ms", "miss", "dr", "sir", "lady", "lord", "master",
+               "mistress", "captain", "capt", "major", "colonel", "sergeant",
+               "sgt", "governor", "mayor", "deputy", "sheriff", "judge",
+               "father", "mother", "aunt", "uncle", "professor", "prof",
+               "reverend", "saint", "st"}
+_NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
+                 "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+                 "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+                 "twenty", "thirty", "forty", "fifty", "hundred", "first",
+                 "second", "third", "fourth", "fifth"}
+_INTERJECTIONS = {"nossir", "yessir", "hrm", "hmm", "hm", "uh", "um", "er", "oh",
+                  "ah", "ha", "huh", "ugh", "hey", "well", "okay", "ok", "yes",
+                  "no", "nope", "yeah", "yep", "shit", "damn", "hell", "god",
+                  "christ", "jesus", "fuck", "ratshit", "aye", "nay"}
+SPEAK_SUBJECT = set((
+    "say said says asked replied answered shouted whispered muttered murmured "
+    "exclaimed cried stammered mumbled called").split())
+SPEAK_INVERT = set((
+    "say said says replied answered whispered muttered murmured exclaimed cried "
+    "stammered mumbled shouted").split())
+
+_NAME_TOKEN = re.compile(r"^[A-Z][A-Za-z'’\-]*\.?$")
+
+
+def name_shaped(name):
+    if not name:
+        return False
+    toks = name.split()
+    if not toks or len(toks) > 3:
+        return False
+    low = name.lower()
+    if low in _NUMBER_WORDS or low in _INTERJECTIONS:
+        return False
+    for t in toks:
+        if not _NAME_TOKEN.match(t):
+            return False
+        core = t.rstrip(".").rstrip("s")
+        if len(core) >= 2 and core.isupper():
+            return False
+    if len(toks) == 1 and toks[0].lower().rstrip(".") in _HONORIFICS:
+        return False
+    return True
+
+
+def _book_speech_agents(out_dir, idd):
+    import json
+    path = os.path.join(out_dir, idd + ".book")
+    agents = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return agents
+    chars = data.get("characters", data) if isinstance(data, dict) else data
+    for ch in chars or ():
+        verbs = {a.get("w", "").lower() for a in ch.get("agent", ())}
+        if verbs & SPEAK_VERBS:
+            agents.add(str(ch.get("id")))
+    return agents
+
+
+def _text_speakers(tokens):
+    text = " ".join(t.get("word", "") for t in tokens)
+    name = r"[A-Z][a-zA-Z'’.\-]+(?:\s+[A-Z][a-zA-Z'’.\-]+)?"
+    subj = "|".join(sorted(SPEAK_SUBJECT, key=len, reverse=True))
+    invert = "|".join(sorted(SPEAK_INVERT, key=len, reverse=True))
+    speakers = set()
+    for m in re.finditer(r"(%s)\s+(?:%s)\b" % (name, subj), text):
+        speakers.add(m.group(1).split()[0].lower())
+    for m in re.finditer(r"\b(?:%s)\s+(%s)" % (invert, name), text):
+        speakers.add(m.group(1).split()[0].lower())
+    return speakers
+
 
 def _read_tsv(path):
     # QUOTE_NONE is essential: these files contain tokens that are literally a
@@ -80,7 +161,20 @@ class BookNLPDoc:
             if e["cat"] == "PER" and e["prop"] == "PROP":
                 counts.setdefault(e["COREF"], {})
                 counts[e["COREF"]][e["text"]] = counts[e["COREF"]].get(e["text"], 0) + 1
-        self.name_of = {c: max(d, key=d.get) for c, d in counts.items()}
+        raw_name_of = {c: max(d, key=d.get) for c, d in counts.items()}
+
+        speech_agents = _book_speech_agents(out_dir, idd)
+        text_speakers = _text_speakers(self.tokens)
+        have_signal = bool(speech_agents or text_speakers)
+
+        def _speaks(coref, nm):
+            if not have_signal:
+                return True
+            return coref in speech_agents or nm.split()[0].lower() in text_speakers
+
+        self.name_of = {c: nm for c, nm in raw_name_of.items()
+                        if name_shaped(nm) and _speaks(c, nm)}
+        self.name_of_all = raw_name_of
 
     def display(self, coref):
         return self.name_of.get(coref)

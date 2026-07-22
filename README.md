@@ -248,6 +248,17 @@ resident at once instead of swapping on every line. The router:
 
 Warm requests then run ~11 s per sentence with no load stall between speakers.
 
+**Faithfulness check (anti-hallucination).** Chatterbox occasionally emits
+gibberish — most often on short fragments or the first line into an unread
+region. Every synthesized chunk is transcribed with Whisper and compared to
+the text it was asked to read (word-similarity **and** a transcript-length
+window, so extra babble or a half-read line is caught even when the words that
+*are* there match). A failing chunk is regenerated a few times; if it still
+fails it's split into smaller pieces that are each re-checked, rather than
+shipping the least-bad take. On by default; set `CHATTERBOX_TTS_VALIDATE=0` to
+turn it off, or `CHATTERBOX_TTS_VALIDATE_MODEL` to change the Whisper size
+(default `base`).
+
 ---
 
 ## Discord voice bot
@@ -360,7 +371,7 @@ SumatraPDF's own window. Like a screen reader, but with a cast.
 
 The Read Aloud button uses either the built-in Windows TTS or the Chatterbox
 audiobook engine — your choice, flipped from a checkable menu item inside
-SumatraPDF (**Settings → Read Aloud with Chatterbox Voices**). No extra
+SumatraPDF (**Read Aloud → Voice → Use Chatterbox voices**). No extra
 button, no second window, no config files.
 
 ### Installing
@@ -378,7 +389,7 @@ shell, no scripts, nothing to configure.
 **Then just use it:**
 
 1. Open any PDF in SumatraPDF.
-2. Tick **Settings → Read Aloud with Chatterbox Voices** (once).
+2. Tick **Read Aloud → Voice → Use Chatterbox voices** (once).
 3. Press **Read Aloud** (the speaker icon in the toolbar). Press it again to
    stop.
 
@@ -412,11 +423,13 @@ which:
 
 1. **Starts the TTS server** if it isn't already running.
 2. **Works out who speaks each line.** An LLM (LM Studio, any
-   OpenAI-compatible local server) reads the book once, attributes every
-   quoted line to a character, and discovers the cast. The result is cached
-   in `audiobook/cache/` by file hash, so it's a one-time cost per book.
-   **No LM Studio? It still works** — the whole book is read in the
-   narrator voice.
+   OpenAI-compatible local server) — or the local **BookNLP** engine, which
+   needs no LLM — reads the book once, attributes every quoted line to a
+   character, and discovers the cast (pick the engine in the
+   [Characters panel](#the-characters-panel--casting-the-book)). The result
+   is cached in `audiobook/cache/` by file hash, so it's a one-time cost per
+   book. **No analysis at all? It still works** — the whole book is read in
+   the narrator voice.
 3. **Casts voices.** The narrator (most of the book) gets one voice;
    characters get the others. A saved casting is reused; anything unset is
    auto-assigned and saved so it's stable.
@@ -429,15 +442,47 @@ which:
 The `Audiobook` settings (SumatraPDF's **Settings → Advanced Options**):
 `UseChatterbox` (the menu toggle), `ChatterboxDir` (auto-detected),
 `PythonExe` (empty = the install's `.venv-amd` Python), `TtsServerPort`,
-`LmStudioUrl`, `NarratorVoice` (empty = first available voice).
+`LmStudioUrl`, `NarratorVoice` (empty = first available voice), `CharSort`
+(the Characters panel's sort order, set from the panel itself).
+
+### The Characters panel — casting the book
+
+**Read Aloud → Audiobook Characters** opens a panel docked to the left of the
+document (a checkable toggle, greyed out under Windows TTS since it has no
+cast). It's where you see and control who reads what:
+
+- **A row per character**, each with a **voice dropdown** — pick which trained
+  voice speaks that character; the narrator has its own row. Choices save to
+  the book's casting and take effect on the next line.
+- **Sort order** — a dropdown at the top orders the cast **by first
+  appearance, last appearance, most lines, fewest lines, or name (A–Z / Z–A)**;
+  the choice is remembered (`CharSort`).
+- **Train…** next to any character opens **Voice Lab** for that character
+  (see below), pre-loaded with this book's cast.
+- **Analyse with** — choose who works out the speakers:
+  - **A local LLM** (LM Studio / Ollama) — reads the book and attributes every
+    line; you can point it at one or several endpoints and analyse the whole
+    book or just part of it.
+  - **BookNLP (local, no LLM needed)** — a self-contained local pipeline
+    (BERT models exported to ONNX) that does quote attribution without any LLM
+    server. Pick it and the LLM-endpoint controls disappear.
+- **Analyse** runs the chosen engine (minutes on a full book, cached
+  afterwards). It can analyse part of a book and **continue** a partial run;
+  anything not yet attributed simply reads in the narrator's voice until it is.
 
 ### Making & tuning character voices — Voice Lab
 
 Character voices are made and refined in **Voice Lab**, opened from the
-helper window (`.\run_audiobook.ps1` → **Voice Lab…**):
+Characters panel's **Train…** button (or from the helper window,
+`.\run_audiobook.ps1` → **Voice Lab…**):
 
 - **Train a new voice from recordings** — the same VAD + Whisper + LoRA
   fine-tuning pipeline as the web app's Voice Training tab.
+- **Reference audio** — set a reference clip per voice (Set / Hear / Remove;
+  capped at 30 s and stored as `voices/<name>/reference.wav`). The ONNX engine
+  clones zero-shot from this clip, and its conditioning cache keys on the
+  file's path + modification time, so swapping the reference takes effect on
+  the very next line — no restart.
 - **Wave match** — the tuner clones the *reference speaker's own passages*
   across a grid of generation settings and measures every candidate's
   waveform against the real recording: speaker-embedding similarity

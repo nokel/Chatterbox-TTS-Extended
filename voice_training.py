@@ -331,13 +331,13 @@ def make_voice_conds(voice_name):
     if not wavs:
         raise RuntimeError(f"No dataset audio found in {wav_dir}")
 
-    # Concatenate the longest utterances into a ~12s reference clip.
+    # Concatenate the longest utterances into a ~45s reference clip.
     ref_parts, ref_len = [], 0
     for w in wavs:
         audio, _ = librosa.load(w, sr=DATASET_SR, mono=True)
         ref_parts.append(audio)
         ref_len += len(audio)
-        if ref_len >= 12 * DATASET_SR:
+        if ref_len >= 45 * DATASET_SR:
             break
     ref_path = os.path.join(voice_dir, "reference.wav")
     ref = np.concatenate(ref_parts)

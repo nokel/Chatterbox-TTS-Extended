@@ -30,7 +30,7 @@ import os
 import shutil
 import tempfile
 
-from audiobook import analyze, pdfbook
+from audiobook import analyze, cast_dedup, pdfbook
 from audiobook.attribution import IdentityMatrix
 from audiobook.booknlp_attribution import BookNLPDoc, attribute
 
@@ -135,14 +135,14 @@ def analyze_book(pdf_path, cfg=None, progress=None, log=None,
         log("Using cached analysis.")
         return cached
 
-    progress(0, 3, "Reading the book")
+    progress(0, 4, "Reading the book")
     units = pdfbook.extract_units(pdf_path)
     for u in units:
         if u["kind"] == "narration":
             u["speaker"] = NARRATOR
     text, _ = _build_document(units)
 
-    progress(1, 3, "Finding characters and quotes (BookNLP)")
+    progress(1, 4, "Finding characters and quotes (BookNLP)")
     out_dir = tempfile.mkdtemp(prefix="booknlp_")
     try:
         from audiobook import booknlp_compat
@@ -155,9 +155,10 @@ def analyze_book(pdf_path, cfg=None, progress=None, log=None,
         bn = BookNLP("en", {"pipeline": "entity,quote,coref", "model": model})
         bn.process(in_path, out_dir, "book")
 
-        progress(2, 3, "Assigning speakers")
+        progress(2, 4, "Assigning speakers")
         doc = BookNLPDoc(out_dir, "book")
-        marked = attribute(doc, identity=IdentityMatrix())
+        identity = IdentityMatrix()
+        marked = attribute(doc, identity=identity)
         _assign(units, doc, marked)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -166,6 +167,9 @@ def analyze_book(pdf_path, cfg=None, progress=None, log=None,
     for u in units:
         if u["kind"] == "dialogue" and not u.get("speaker"):
             u["speaker"] = UNKNOWN
+
+    progress(3, 4, "Reviewing the cast")
+    cast_dedup.dedup(units, identity, cfg=cfg, log=log)
 
     characters = {}
     for u in units:
@@ -183,6 +187,6 @@ def analyze_book(pdf_path, cfg=None, progress=None, log=None,
         "lines_total": n_dialogue,
     }
     pdfbook.save_analysis(pdf_path, analysis)
-    progress(3, 3, "Done")
+    progress(4, 4, "Done")
     log(f"BookNLP: {len(characters)} characters over {n_dialogue} lines")
     return analysis

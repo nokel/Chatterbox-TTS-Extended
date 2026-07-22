@@ -36,7 +36,7 @@ VE_SR = 16000
 REF_MAX_SEC = 60.0
 
 # score = weighted sum of similarity components, each in [0, 1]
-W_SPEAKER, W_SPECTRUM, W_PITCH = 0.65, 0.20, 0.15
+W_SPEAKER, W_SPECTRUM, W_PITCH, W_RHYTHM = 0.55, 0.15, 0.10, 0.20
 
 DEFAULT_GRID = {
     "exaggeration": [0.35, 0.5, 0.65],
@@ -113,6 +113,31 @@ def pitch_stats(x, sr):
                                            - np.percentile(st, 25))
 
 
+def mel_spec(x, sr, width=700, n_mels=80):
+    """Log-mel spectrogram normalized to [0, 1] for drawing."""
+    import librosa
+    hop = max(256, len(x) // width)
+    m = librosa.feature.melspectrogram(y=x.astype(np.float32), sr=sr,
+                                       n_mels=n_mels, hop_length=hop,
+                                       fmax=8000)
+    db = librosa.power_to_db(m, ref=np.max, top_db=80.0)
+    return ((db + 80.0) / 80.0).astype(np.float32)
+
+
+def rhythm_profile(x, sr):
+    """(pause_to_speech_ratio, bursts_per_sec, mean_burst_sec) via VAD,
+    or None when the clip is too short or VAD is unavailable."""
+    try:
+        import voice_training
+        segs, speech, gaps = voice_training._clip_pause_profile(
+            np.asarray(x, dtype=np.float32), sr)
+    except Exception:
+        return None
+    if not segs or speech < 2.0:
+        return None
+    return (gaps / speech, len(segs) / speech, speech / len(segs))
+
+
 def wave_trace(x, sr, points=700):
     """Min/max amplitude envelope for drawing: [(lo, hi), ...]."""
     x = np.asarray(x, dtype=np.float32)
@@ -141,9 +166,20 @@ def _similarity(ref, cand_wav, sr, voice_name):
         d_iqr = abs(cp[1] - ref["pitch"][1])
         s_pitch = float(np.exp(-(d_med / 2.0 + d_iqr / 4.0)))
 
-    total = W_SPEAKER * s_spk + W_SPECTRUM * s_spec + W_PITCH * s_pitch
+    s_rhythm = 0.5
+    cr = rhythm_profile(cand_wav, sr)
+    if cr is not None and ref.get("rhythm") is not None:
+        rr = ref["rhythm"]
+        d_pause = abs(cr[0] - rr[0])
+        d_rate = abs(cr[1] - rr[1])
+        d_burst = abs(cr[2] - rr[2])
+        s_rhythm = float(np.exp(-(d_pause / 0.4 + d_rate / 1.5
+                                  + d_burst / 3.0)))
+
+    total = (W_SPEAKER * s_spk + W_SPECTRUM * s_spec + W_PITCH * s_pitch
+             + W_RHYTHM * s_rhythm)
     return {"score": total, "speaker": s_spk, "spectrum": s_spec,
-            "pitch": s_pitch}
+            "pitch": s_pitch, "rhythm": s_rhythm}
 
 
 # ------------------------------------------------------------ reference ----
@@ -205,7 +241,10 @@ def reference_features(voice_name, audio_paths=None, transcribe_fn=None):
         "embed": speaker_embed(voice_name, ref_wav, sr0),
         "ltas": ltas(ref_wav, sr0),
         "pitch": pitch_stats(ref_wav, sr0),
+        "rhythm": rhythm_profile(ref_wav, sr0),
         "trace": wave_trace(ref_wav, sr0),
+        "spec": mel_spec(ref_wav, sr0),
+        "wav": ref_wav,
         "sr": sr0,
         "passages": [p for p in passages if p],
         "seconds": float(len(ref_wav) / sr0),
@@ -254,7 +293,7 @@ def auto_match(voice_name, ref=None, grid=None, tts_url=synth.DEFAULT_TTS_URL,
         sim = _similarity(ref, wav, sr, voice_name)
         log(f"  {p} -> score {sim['score']:.4f} "
             f"(spk {sim['speaker']:.3f} spec {sim['spectrum']:.3f} "
-            f"pitch {sim['pitch']:.3f})")
+            f"pitch {sim['pitch']:.3f} rhythm {sim['rhythm']:.3f})")
         results.append({"params": p, **sim,
                         "trace": wave_trace(wav, sr), "wav": wav, "sr": sr})
     if not results:
@@ -264,6 +303,9 @@ def auto_match(voice_name, ref=None, grid=None, tts_url=synth.DEFAULT_TTS_URL,
     # keep audio only for the winner to stay light
     for r in results[1:]:
         r.pop("wav", None)
+    results[0]["spec"] = mel_spec(results[0]["wav"], results[0]["sr"])
     progress(len(pts), len(pts), "Done")
     return {"best": results[0], "candidates": results,
-            "ref_trace": ref["trace"], "passages": ref["passages"]}
+            "ref_trace": ref["trace"], "ref_spec": ref["spec"],
+            "ref_wav": ref["wav"], "ref_sr": ref["sr"],
+            "passages": ref["passages"]}

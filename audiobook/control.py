@@ -577,6 +577,11 @@ class EngineState:
             # anyway: uncast, it reads as the narrator. The status line is
             # where "how much is analysed" belongs.
             cast = []
+            first = {}
+            for i, u in enumerate(self.units):
+                sp = u.get("speaker")
+                if sp and sp not in first:
+                    first[sp] = i
             for name in sorted(self.characters,
                                key=lambda c: -self.characters.get(c, 0)):
                 if not isinstance(name, str) or not name:
@@ -585,7 +590,8 @@ class EngineState:
                     continue
                 cast.append({"name": name,
                              "lines": self.characters.get(name, 0),
-                             "voice": self.voice_of(name) or ""})
+                             "voice": self.voice_of(name) or "",
+                             "first": first.get(name, len(self.units))})
             return {
                 # Which book this engine has. There's one engine per machine
                 # (one control port, one LLM, one set of TTS models) but every

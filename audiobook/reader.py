@@ -155,6 +155,10 @@ class ReaderApp:
 
     def open_book(self, path):
         self.stop()
+        if not os.path.isfile(path):
+            messagebox.showerror("Audiobook Reader",
+                                 f"Not a readable PDF: {path}")
+            return
         self.pdf = path
         self.n_pages = pdfbook.page_count(path)
         self.root.title(f"Chatterbox Audiobook Reader - "
@@ -451,12 +455,35 @@ class ReaderApp:
 
 
 def main():
-    pdf = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].strip() else None
+    args = sys.argv[1:]
+    voice_lab = False
+    character = None
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--voice-lab":
+            voice_lab = True
+        elif a == "--character":
+            if i + 1 < len(args):
+                character = args[i + 1]
+                i += 1
+        elif a.strip() and not a.startswith("--"):
+            positional.append(a)
+        i += 1
+    pdf = positional[0] if positional else None
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.4)
     except tk.TclError:
         pass
+    if voice_lab:
+        from audiobook.voice_lab import CastingSession, VoiceLab
+        root.withdraw()
+        lab = VoiceLab(root, CastingSession(pdf), character=character)
+        lab.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.mainloop()
+        return
     app = ReaderApp(root, pdf)
     def on_close():
         app.stop()

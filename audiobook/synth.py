@@ -111,6 +111,14 @@ def unit_voice(casting, speaker):
     return p["voice"] if p else None
 
 
+class _Session:
+    def __init__(self):
+        self.stop = threading.Event()
+        self.paused = threading.Event()
+        self.q = queue.Queue(maxsize=PREFETCH)
+        self.threads = []
+
+
 class Player:
     """Plays a sequence of units with prefetch, pause/resume and stop.
 
@@ -129,46 +137,51 @@ class Player:
         self.on_unit_end = on_unit_end or (lambda u: None)
         self.on_finish = on_finish or (lambda e: None)
         self.log = log or (lambda *_: None)
-        self._stop = threading.Event()
-        self._paused = threading.Event()
-        self._threads = []
-        self._q = None
+        self._session = None
 
     # ------------------------------------------------------------ control --
     @property
     def playing(self):
-        return any(t.is_alive() for t in self._threads)
+        s = self._session
+        return s is not None and any(t.is_alive() for t in s.threads)
 
     @property
     def paused(self):
-        return self._paused.is_set()
+        s = self._session
+        return s is not None and s.paused.is_set()
 
     def pause(self):
-        self._paused.set()
+        s = self._session
+        if s is not None:
+            s.paused.set()
 
     def resume(self):
-        self._paused.clear()
+        s = self._session
+        if s is not None:
+            s.paused.clear()
 
     def stop(self):
-        self._stop.set()
-        self._paused.clear()
-        for t in self._threads:
-            t.join(timeout=10)
-        self._threads = []
+        s = self._session
+        if s is None:
+            return
+        s.stop.set()
+        s.paused.clear()
+        for t in s.threads:
+            t.join(timeout=2)
+        self._session = None
 
     def play(self, units, start_index=0):
         """Start speaking units[start_index:] in the background."""
         self.stop()
-        self._stop = threading.Event()
-        self._paused = threading.Event()
-        self._q = queue.Queue(maxsize=PREFETCH)
+        s = _Session()
+        self._session = s
         todo = units[start_index:]
         self._send_plan(todo)
-        tp = threading.Thread(target=self._prefetch, args=(todo,),
+        tp = threading.Thread(target=self._prefetch, args=(s, todo),
                               daemon=True, name="ab-prefetch")
-        tb = threading.Thread(target=self._playback, daemon=True,
+        tb = threading.Thread(target=self._playback, args=(s,), daemon=True,
                               name="ab-playback")
-        self._threads = [tp, tb]
+        s.threads = [tp, tb]
         tp.start()
         tb.start()
 
@@ -188,10 +201,10 @@ class Player:
             daemon=True, name="ab-plan").start()
 
     # ------------------------------------------------------------ workers --
-    def _prefetch(self, units):
+    def _prefetch(self, s, units):
         try:
             for i, u in enumerate(units):
-                if self._stop.is_set():
+                if s.stop.is_set():
                     return
                 # warm-ahead: start loading the voice a few units out so a
                 # first-time voice is resident before we need to synth it
@@ -204,7 +217,7 @@ class Player:
                         warm_voice(v, tts_url=self.tts_url)
                 params = voice_params(self.casting, u["speaker"])
                 if params is None:
-                    self._q.put(("error", u, RuntimeError(
+                    s.q.put(("error", u, RuntimeError(
                         f"No voice cast for '{u['speaker']}' and no "
                         "narrator voice set")))
                     return
@@ -214,27 +227,29 @@ class Player:
                     self.log(f"synth {time.time() - t0:4.1f}s "
                              f"[{u['speaker']}] {u['text'][:50]}")
                 except Exception as e:
-                    self._q.put(("error", u, e))
+                    s.q.put(("error", u, e))
                     return
-                while not self._stop.is_set():
+                if s.stop.is_set():
+                    return
+                while not s.stop.is_set():
                     try:
-                        self._q.put(("wav", u, (x, sr)), timeout=0.25)
+                        s.q.put(("wav", u, (x, sr)), timeout=0.25)
                         break
                     except queue.Full:
                         continue
-            self._q.put(("eof", None, None))
+            s.q.put(("eof", None, None))
         except Exception as e:  # pragma: no cover - safety net
-            self._q.put(("error", None, e))
+            s.q.put(("error", None, e))
 
-    def _playback(self):
+    def _playback(self, s):
         import sounddevice as sd
         error = None
         last_para = None
         stream = None
         try:
-            while not self._stop.is_set():
+            while not s.stop.is_set():
                 try:
-                    kind, unit, payload = self._q.get(timeout=0.25)
+                    kind, unit, payload = s.q.get(timeout=0.25)
                 except queue.Empty:
                     continue
                 if kind == "eof":
@@ -253,11 +268,12 @@ class Player:
                 if last_para is not None:
                     gap = GAP_PARA_SEC if unit["para"] != last_para \
                         else GAP_UNIT_SEC
-                    self._write(stream, np.zeros(int(sr * gap), np.float32))
+                    self._write(s, stream, np.zeros(int(sr * gap), np.float32))
                 last_para = unit["para"]
-                self.on_unit_start(unit)
-                self._write(stream, x)
-                if not self._stop.is_set():
+                if self._session is s:
+                    self.on_unit_start(unit)
+                self._write(s, stream, x)
+                if not s.stop.is_set() and self._session is s:
                     self.on_unit_end(unit)
         except Exception as e:
             error = e
@@ -268,15 +284,16 @@ class Player:
                     stream.close()
                 except Exception:
                     pass
-            self._stop.set()  # also winds down the prefetcher
-            self.on_finish(error)
+            s.stop.set()  # also winds down the prefetcher
+            if self._session is s:
+                self.on_finish(error)
 
-    def _write(self, stream, x):
+    def _write(self, s, stream, x):
         """Write audio in small blocks, honoring pause/stop."""
         block = 2048
         for i in range(0, len(x), block):
-            while self._paused.is_set() and not self._stop.is_set():
+            while s.paused.is_set() and not s.stop.is_set():
                 time.sleep(0.05)
-            if self._stop.is_set():
+            if s.stop.is_set():
                 return
             stream.write(np.ascontiguousarray(x[i:i + block]).reshape(-1, 1))

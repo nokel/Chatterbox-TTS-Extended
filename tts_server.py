@@ -49,6 +49,12 @@ MAX_CHUNK_CHARS = 250      # chatterbox is trained on short utterances
 GAIN_LIMIT_DB = 12.0
 PEAK_GUARD = 0.985
 
+VALIDATE = os.environ.get("CHATTERBOX_TTS_VALIDATE", "1") != "0"
+VALIDATE_MODEL = os.environ.get("CHATTERBOX_TTS_VALIDATE_MODEL", "base")
+VALIDATE_OK = 0.80
+VALIDATE_TRIES = 3
+VALIDATE_MIN_SPLIT = 25
+
 # Which engine synthesizes speech.
 #
 # "onnx" (default): the chatterbox-turbo ONNX model. Measured on this machine
@@ -71,7 +77,7 @@ os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASETS_DIR = os.path.join(BASE_DIR, "datasets")
-REF_SECONDS = 15.0         # enough audio for a zero-shot clone
+REF_SECONDS = 45.0         # enough audio for a zero-shot clone
 
 # Residency sizing. A loaded voice model is ~2-2.5 GB. Capacity is derived
 # from free RAM (unified memory on APUs), leaving a reserve, and hard-capped
@@ -87,12 +93,26 @@ app = FastAPI(title="Chatterbox headless TTS")
 _GEN_LOCK = threading.Lock()   # serialize generation (one GPU job at a time)
 
 
+def _voice_usable(name):
+    d = os.path.join(VOICES_DIR, name)
+    if os.path.isfile(os.path.join(d, "t3_cfg.safetensors")):
+        return True
+    if ENGINE == "onnx":
+        if os.path.isfile(os.path.join(d, "reference.wav")):
+            return True
+        if os.path.isfile(os.path.join(d, "loudness_probe.wav")):
+            return True
+        if _dataset_dir_for(name):
+            return True
+    return False
+
+
 def list_voices():
     out = []
     if os.path.isdir(VOICES_DIR):
         for name in sorted(os.listdir(VOICES_DIR)):
-            d = os.path.join(VOICES_DIR, name)
-            if os.path.isfile(os.path.join(d, "t3_cfg.safetensors")):
+            if os.path.isdir(os.path.join(VOICES_DIR, name)) and \
+                    _voice_usable(name):
                 out.append(name)
     return out
 
@@ -372,6 +392,116 @@ def _split_text(text):
     return chunks or [text.strip()]
 
 
+_WHISPER = None
+_WHISPER_LOCK = threading.Lock()
+
+
+def _whisper():
+    global _WHISPER
+    with _WHISPER_LOCK:
+        if _WHISPER is None:
+            import torch
+            import whisper
+            t0 = time.time()
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            _WHISPER = whisper.load_model(VALIDATE_MODEL, device=dev)
+            print(f"[check] whisper '{VALIDATE_MODEL}' ready on {dev} in "
+                  f"{time.time() - t0:.1f}s", flush=True)
+    return _WHISPER
+
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven "
+         "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+         "nineteen").split()
+_TENS = "twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def _num_words(n):
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        t = _TENS[n // 10 - 2]
+        return t if n % 10 == 0 else t + " " + _ONES[n % 10]
+    if n < 1000:
+        s = _ONES[n // 100] + " hundred"
+        return s if n % 100 == 0 else s + " " + _num_words(n % 100)
+    if n < 1000000:
+        s = _num_words(n // 1000) + " thousand"
+        return s if n % 1000 == 0 else s + " " + _num_words(n % 1000)
+    return " ".join(_ONES[int(d)] for d in str(n))
+
+
+def _norm_words(s):
+    s = re.sub(r"(\d),(\d)", r"\1\2", s.lower())
+    s = re.sub(r"[^a-z0-9' ]+", " ", s)
+    s = re.sub(r"(?<=\d)(?=[a-z])|(?<=[a-z])(?=\d)", " ", s)
+    s = re.sub(r"\d+", lambda m: _num_words(int(m.group(0))), s)
+    return " ".join(s.split())
+
+
+def _chunk_check(x, sr, text):
+    import difflib
+    import torch
+    import torchaudio
+    want = _norm_words(text)
+    if not want:
+        return True, 1.0, ""
+    wav = torch.from_numpy(np.asarray(x, dtype=np.float32))
+    if sr != 16000:
+        wav = torchaudio.functional.resample(wav, sr, 16000)
+    m = _whisper()
+    r = m.transcribe(wav.numpy(), fp16=(m.device.type == "cuda"))
+    heard = _norm_words(r["text"])
+    ratio = difflib.SequenceMatcher(None, want, heard).ratio()
+    slack = max(10, int(0.2 * len(want)))
+    ok = ratio >= VALIDATE_OK and abs(len(heard) - len(want)) <= slack
+    return ok, ratio, heard
+
+
+def _split_smaller(text):
+    text = text.strip()
+    for pat in (r"(?<=[.!?])\s+", r"(?<=[;:,])\s+"):
+        parts = [p for p in re.split(pat, text) if p]
+        if len(parts) > 1:
+            mid = len(parts) // 2
+            return [" ".join(parts[:mid]), " ".join(parts[mid:])]
+    words = text.split()
+    if len(words) > 1:
+        mid = len(words) // 2
+        return [" ".join(words[:mid]), " ".join(words[mid:])]
+    return None
+
+
+def _speak_chunk(text, sr, synth, gen=None):
+    x = synth(gen, text)
+    if not VALIDATE:
+        return x
+    ok, ratio, heard = _chunk_check(x, sr, text)
+    best_ratio, best = ratio, x
+    tries = 1
+    while not ok and tries < VALIDATE_TRIES:
+        print(f"[check] mismatch {ratio:.2f} (try {tries}): "
+              f"asked {text[:70]!r} heard {heard[:70]!r}", flush=True)
+        x = synth(None, text)
+        ok, ratio, heard = _chunk_check(x, sr, text)
+        if ratio > best_ratio:
+            best_ratio, best = ratio, x
+        tries += 1
+    if ok:
+        return x
+    if len(text) >= VALIDATE_MIN_SPLIT:
+        halves = _split_smaller(text)
+        if halves:
+            print(f"[check] no attempt passed after {tries}; splitting "
+                  f"{text[:70]!r}", flush=True)
+            parts = [_speak_chunk(h, sr, synth) for h in halves]
+            gap = np.zeros(int(0.05 * sr), dtype=np.float32)
+            return np.concatenate([parts[0], gap, parts[1]])
+    print(f"[check] no attempt passed; keeping best of {tries} "
+          f"({best_ratio:.2f}) for {text[:70]!r}", flush=True)
+    return best
+
+
 def _match_loudness(x, sr, target_db):
     """Gain the waveform so its speech RMS hits target_db (clamped, peak-safe)."""
     if target_db is None:
@@ -476,18 +606,22 @@ def tts(req: TTSRequest):
             if req.seed is not None:
                 gen = torch.Generator()
                 gen.manual_seed(req.seed)
+            sr = model.sr
             pieces = []
-            for chunk in _split_text(text):
+
+            def synth(g, t):
                 wav = model.generate(
-                    chunk,
+                    t,
                     audio_prompt_path=ref,
                     exaggeration=req.exaggeration,
                     cfg_weight=req.cfg_weight,
                     temperature=req.temperature,
-                    generator=gen,
+                    generator=g,
                 )
-                pieces.append(wav.squeeze(0).cpu().numpy())
-            sr = model.sr
+                return wav.squeeze(0).cpu().numpy()
+
+            for chunk in _split_text(text):
+                pieces.append(_speak_chunk(chunk, sr, synth, gen))
     else:
         # load (or wait for a warm already in flight) OUTSIDE the generation
         # lock, so warming another voice doesn't block a voice that's speaking
@@ -498,17 +632,21 @@ def tts(req: TTSRequest):
             if req.seed is not None:
                 gen = torch.Generator(device=model.device)
                 gen.manual_seed(req.seed)
+            sr = model.sr
             pieces = []
-            for chunk in _split_text(text):
+
+            def synth(g, t):
                 wav = model.generate(
-                    chunk,
+                    t,
                     exaggeration=req.exaggeration,
                     cfg_weight=req.cfg_weight,
                     temperature=req.temperature,
-                    generator=gen,
+                    generator=g,
                 )
-                pieces.append(wav.squeeze(0).cpu().numpy())
-            sr = model.sr
+                return wav.squeeze(0).cpu().numpy()
+
+            for chunk in _split_text(text):
+                pieces.append(_speak_chunk(chunk, sr, synth, gen))
 
     x = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
     x = _match_loudness(x, sr, get_voice_loudness(req.voice))
